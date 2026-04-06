@@ -1,7 +1,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import { query } from "../db";
 import { adjustBalance } from "../services/userService";
-import { formatUSD } from "../utils";
+import { formatUSD, b } from "../utils";
 
 export async function handleTasks(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const tasks = await query(
@@ -19,7 +19,7 @@ export async function handleTasks(bot: TelegramBot, chatId: number, userId: numb
     return;
   }
 
-  let text = `📋 *Tasks & Rewards*\n\n`;
+  let text = `📋 ${b("Tasks &amp; Rewards")}\n\n`;
   const keyboard: TelegramBot.InlineKeyboardButton[][] = [];
 
   for (const task of tasks.rows) {
@@ -28,7 +28,7 @@ export async function handleTasks(bot: TelegramBot, chatId: number, userId: numb
     const progress = task.progress || 0;
     const icon = isClaimed ? "✅" : isCompleted ? "🎁" : "🔲";
 
-    text += `${icon} *${task.name}*\n`;
+    text += `${icon} ${b(task.name)}\n`;
     text += `   ${task.description}\n`;
     text += `   Reward: ${formatUSD(parseFloat(task.reward))}\n`;
     if (task.target_value > 1) {
@@ -45,12 +45,12 @@ export async function handleTasks(bot: TelegramBot, chatId: number, userId: numb
   }
 
   await bot.sendMessage(chatId, text, {
-    parse_mode: "Markdown",
+    parse_mode: "HTML",
     reply_markup: keyboard.length > 0 ? { inline_keyboard: keyboard } : undefined,
   });
 }
 
-export async function handleClaimTask(bot: TelegramBot, chatId: number, userId: number, taskId: number): Promise<void> {
+export async function handleClaimTask(bot: TelegramBot, callbackQueryId: string, chatId: number, userId: number, taskId: number): Promise<void> {
   const taskResult = await query(
     `SELECT ut.*, t.name, t.reward FROM user_tasks ut 
      JOIN tasks t ON t.id = ut.task_id
@@ -59,7 +59,9 @@ export async function handleClaimTask(bot: TelegramBot, chatId: number, userId: 
   );
 
   if (!taskResult.rows[0]) {
-    await bot.answerCallbackQuery("", { text: "Task not available or already claimed." });
+    try {
+      await bot.answerCallbackQuery(callbackQueryId, { text: "Task not available or already claimed." });
+    } catch { /* ignore */ }
     return;
   }
 
@@ -74,18 +76,24 @@ export async function handleClaimTask(bot: TelegramBot, chatId: number, userId: 
   await adjustBalance(userId, reward, 0, "bonus", `Task reward: ${task.name}`);
 
   await bot.sendMessage(chatId,
-    `🎉 *Task Completed!*\n\n${task.name}\nReward: *${formatUSD(reward)}* added to your balance!`,
-    { parse_mode: "Markdown" }
+    `🎉 ${b("Task Completed!")}\n\n${task.name}\nReward: ${b(formatUSD(reward))} added to your balance!`,
+    { parse_mode: "HTML" }
   );
 }
 
-export async function updateTaskProgress(userId: number, taskType: string, increment: number = 1): Promise<void> {
+export async function updateTaskProgress(userId: number, taskType: string, increment: number = 1, targetAmount?: number): Promise<void> {
   const tasks = await query(
     "SELECT * FROM tasks WHERE task_type=$1 AND is_active=TRUE",
     [taskType]
   );
 
   for (const task of tasks.rows) {
+    // For deposit tasks, check if the amount meets threshold
+    if (taskType === "make_deposit" && targetAmount !== undefined && task.target_value > 1) {
+      if (targetAmount < task.target_value) continue;
+      increment = task.target_value; // Mark as complete directly
+    }
+
     const existing = await query(
       "SELECT * FROM user_tasks WHERE user_id=$1 AND task_id=$2",
       [userId, task.id]
@@ -98,12 +106,15 @@ export async function updateTaskProgress(userId: number, taskType: string, incre
 
     if (existing.rows[0]) {
       await query(
-        "UPDATE user_tasks SET progress=$1, completed=$2, completed_at=CASE WHEN $2 THEN NOW() ELSE completed_at END WHERE user_id=$3 AND task_id=$4",
+        `UPDATE user_tasks SET progress=$1, completed=$2, 
+          completed_at=CASE WHEN $2 THEN NOW() ELSE completed_at END 
+         WHERE user_id=$3 AND task_id=$4`,
         [Math.min(currentProgress, task.target_value), completed, userId, task.id]
       );
     } else {
       await query(
-        "INSERT INTO user_tasks (user_id, task_id, progress, completed, completed_at) VALUES ($1, $2, $3, $4, CASE WHEN $4 THEN NOW() ELSE NULL END)",
+        `INSERT INTO user_tasks (user_id, task_id, progress, completed, completed_at) 
+         VALUES ($1, $2, $3, $4, CASE WHEN $4 THEN NOW() ELSE NULL END)`,
         [userId, task.id, Math.min(currentProgress, task.target_value), completed]
       );
     }

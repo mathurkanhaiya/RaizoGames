@@ -1,5 +1,5 @@
 import { query } from "../db";
-import { adjustBalance, getUser } from "./userService";
+import { adjustBalance } from "./userService";
 import { recordDeposit } from "./riskService";
 import axios from "axios";
 
@@ -22,45 +22,50 @@ export interface DepositRecord {
 }
 
 export async function createOxaPayInvoice(userId: number, amountUSD: number): Promise<{ payUrl: string; orderId: string } | null> {
+  const orderId = `DEP_${userId}_${Date.now()}`;
+
   try {
-    const response = await axios.post(`${OXAPAY_API}/merchants/request`, {
-      merchant: OXAPAY_KEY,
-      amount: amountUSD,
-      currency: "USDT",
-      lifeTime: 30,
-      feePaidByPayer: 0,
-      underPaidCover: 5,
-      callbackUrl: `${process.env.WEBHOOK_URL || ""}/api/webhook/oxapay`,
-      returnUrl: `https://t.me/${process.env.BOT_USERNAME || "RaizoPvPBot"}`,
-      description: `RAIZO GAMES Deposit - User ${userId}`,
-      orderId: `DEP_${userId}_${Date.now()}`,
-    });
+    const response = await axios.post(
+      `${OXAPAY_API}/merchants/request`,
+      {
+        merchant: OXAPAY_KEY,
+        amount: amountUSD,
+        currency: "USDT",
+        lifeTime: 30,
+        feePaidByPayer: 0,
+        underPaidCover: 5,
+        callbackUrl: `${process.env.WEBHOOK_URL || ""}/api/webhook/oxapay`,
+        returnUrl: `https://t.me/${process.env.BOT_USERNAME || "RaizoPvPBot"}`,
+        description: `RAIZO GAMES Deposit - User ${userId}`,
+        orderId,
+      },
+      { timeout: 10000 }
+    );
 
     if (response.data?.result === 100) {
-      const orderId = response.data.trackId || `DEP_${userId}_${Date.now()}`;
-
-      // Create pending deposit record
+      const trackId = response.data.trackId || orderId;
       await query(
         `INSERT INTO deposits (user_id, method, amount, usd_amount, status, oxapay_order_id)
          VALUES ($1, 'usdt', $2, $2, 'pending', $3)`,
-        [userId, amountUSD, orderId]
+        [userId, amountUSD, trackId]
       );
-
-      return { payUrl: response.data.payLink, orderId };
+      return { payUrl: response.data.payLink, orderId: trackId };
     }
-  } catch (err) {
-    // fallback: create manual deposit link
+  } catch {
+    // Fallback to manual deposit
   }
 
-  // Fallback: create manual deposit instruction
-  const orderId = `DEP_${userId}_${Date.now()}`;
+  // Fallback — record pending deposit with a direct link
   await query(
     `INSERT INTO deposits (user_id, method, amount, usd_amount, status, oxapay_order_id)
      VALUES ($1, 'usdt', $2, $2, 'pending', $3)`,
-    [userId, 0, orderId]
+    [userId, amountUSD, orderId]
   );
 
-  return { payUrl: `https://oxapay.com/pay/${orderId}`, orderId };
+  return {
+    payUrl: `https://oxapay.com/pay/${orderId}`,
+    orderId,
+  };
 }
 
 export async function confirmOxaPayDeposit(orderId: string, amountPaid: number): Promise<boolean> {
@@ -68,7 +73,6 @@ export async function confirmOxaPayDeposit(orderId: string, amountPaid: number):
     "SELECT * FROM deposits WHERE oxapay_order_id=$1 AND status='pending'",
     [orderId]
   );
-
   if (!depResult.rows[0]) return false;
   const dep = depResult.rows[0];
 
@@ -79,26 +83,31 @@ export async function confirmOxaPayDeposit(orderId: string, amountPaid: number):
 
   await adjustBalance(dep.user_id, amountPaid, 0, "deposit", `USDT deposit via OxaPay`, orderId);
   await recordDeposit(amountPaid);
-
-  // Check referral reward on first deposit
   await grantReferralOnDeposit(dep.user_id, amountPaid);
 
   return true;
 }
 
-export async function recordStarsDeposit(userId: number, starsCount: number): Promise<{ lockedUntil: Date; usdAmount: number }> {
+// Record Stars deposit from a real Telegram Stars (XTR) invoice payment
+export async function recordStarsDeposit(
+  userId: number,
+  starsCount: number,
+  telegramChargeId?: string
+): Promise<{ lockedUntil: Date; usdAmount: number }> {
   const usdAmount = starsCount * 0.01;
   const lockedUntil = new Date(Date.now() + 21 * 24 * 60 * 60 * 1000);
 
   await query(
-    `INSERT INTO deposits (user_id, method, amount, usd_amount, status, stars_count, locked_until)
-     VALUES ($1, 'stars', $2, $2, 'pending', $3, $4)`,
-    [userId, usdAmount, starsCount, lockedUntil]
+    `INSERT INTO deposits (user_id, method, amount, usd_amount, status, stars_count, locked_until, tx_hash)
+     VALUES ($1, 'stars', $2, $2, 'pending', $3, $4, $5)
+     ON CONFLICT DO NOTHING`,
+    [userId, usdAmount, starsCount, lockedUntil, telegramChargeId || null]
   );
 
   return { lockedUntil, usdAmount };
 }
 
+// Unlock Stars deposits that have passed the 21-day lock
 export async function processLockedStars(): Promise<void> {
   const unlocked = await query(
     `SELECT * FROM deposits 
@@ -110,7 +119,14 @@ export async function processLockedStars(): Promise<void> {
       "UPDATE deposits SET status='confirmed', confirmed_at=NOW() WHERE id=$1",
       [dep.id]
     );
-    await adjustBalance(dep.user_id, parseFloat(dep.usd_amount), 0, "deposit", `Stars deposit (${dep.stars_count} ⭐)`, String(dep.id));
+    await adjustBalance(
+      dep.user_id,
+      parseFloat(dep.usd_amount),
+      0,
+      "deposit",
+      `Stars deposit unlocked (${dep.stars_count} ⭐)`,
+      String(dep.id)
+    );
     await recordDeposit(parseFloat(dep.usd_amount));
     await grantReferralOnDeposit(dep.user_id, parseFloat(dep.usd_amount));
   }
@@ -135,18 +151,12 @@ async function grantReferralOnDeposit(userId: number, amount: number): Promise<v
   const wasFirstDeposit = parseFloat(user.total_deposited) === 0;
   if (!wasFirstDeposit) return;
 
-  const commission = amount * 0.05; // 5% of first deposit
+  const commission = amount * 0.05;
   await adjustBalance(user.referral_id, commission, 0, "referral", `Referral commission from user ${userId} first deposit`);
   await query(
     `INSERT INTO referral_earnings (referrer_id, referee_id, tier, amount, source_type)
      VALUES ($1, $2, 1, $3, 'deposit')`,
     [user.referral_id, userId, commission]
-  );
-
-  // Update total deposited
-  await query(
-    "UPDATE bot_users SET total_deposited = total_deposited + $1, updated_at=NOW() WHERE id=$2",
-    [amount, userId]
   );
 }
 

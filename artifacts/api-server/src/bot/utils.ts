@@ -82,3 +82,34 @@ export function truncateName(name: string | null, maxLen = 20): string {
 export function formatDate(date: Date): string {
   return date.toISOString().replace("T", " ").substring(0, 19) + " UTC";
 }
+
+// Escape HTML special characters to prevent Telegram HTML parse errors
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Format a user display name safely for HTML mode
+export function safeUserName(username?: string | null, firstName?: string | null, userId?: number): string {
+  if (username) return escapeHtml(`@${username}`);
+  if (firstName) return escapeHtml(firstName);
+  return `User#${userId || "?"}`;
+}
+
+// Bold text (HTML)
+export function b(text: string): string {
+  return `<b>${text}</b>`;
+}
+
+// Italic text (HTML)
+export function i(text: string): string {
+  return `<i>${text}</i>`;
+}
+
+// Code text (HTML)
+export function code(text: string): string {
+  return `<code>${escapeHtml(text)}</code>`;
+}

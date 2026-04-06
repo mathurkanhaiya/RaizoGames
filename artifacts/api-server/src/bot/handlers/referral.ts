@@ -1,7 +1,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import { getUser } from "../services/userService";
 import { query } from "../db";
-import { formatUSD } from "../utils";
+import { formatUSD, escapeHtml, b, i } from "../utils";
 
 export async function handleReferral(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const user = await getUser(userId);
@@ -9,7 +9,6 @@ export async function handleReferral(bot: TelegramBot, chatId: number, userId: n
 
   const botUsername = process.env.BOT_USERNAME || "RaizoPvPBot";
 
-  // Count referrals
   const stats = await query(
     `SELECT 
       COUNT(*) as total_referrals,
@@ -23,24 +22,27 @@ export async function handleReferral(bot: TelegramBot, chatId: number, userId: n
   const totalReferrals = parseInt(stats.rows[0]?.total_referrals || "0");
   const totalEarned = parseFloat(stats.rows[0]?.total_earned || "0");
 
-  const text = `👥 *Refer & Earn*\n\n`
+  const text = `👥 ${b("Refer &amp; Earn")}\n\n`
     + `Invite friends and earn commissions:\n`
-    + `• Tier 1: *5%* of referee's first deposit\n`
-    + `• Tier 2 (VIP): *10%* commission\n\n`
+    + `• Tier 1: ${b("5%")} of referee's first deposit\n`
+    + `• Tier 2 (VIP): ${b("10%")} commission\n\n`
     + `🛡 Commission requires real deposit from referee\n\n`
     + `━━━━━━━━━━━━━━━━━━━\n`
-    + `📊 *Your Stats:*\n`
+    + `📊 ${b("Your Stats:")}\n`
     + `• Referrals: ${totalReferrals}\n`
     + `• Total Earned: ${formatUSD(totalEarned)}\n\n`
-    + `🔗 *Your Referral Link:*\n`
-    + `\`${referralLink}\`\n\n`
+    + `🔗 ${b("Your Referral Link:")}\n`
+    + `${escapeHtml(referralLink)}\n\n`
     + `Share this link — when someone signs up and deposits, you earn!`;
 
   await bot.sendMessage(chatId, text, {
-    parse_mode: "Markdown",
+    parse_mode: "HTML",
     reply_markup: {
       inline_keyboard: [
-        [{ text: "📤 Share Invite Link", url: `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=${encodeURIComponent("Join RAIZO GAMES - Fast PvP Casino Bot! 🎰")}` }],
+        [{
+          text: "📤 Share Invite Link",
+          url: `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=${encodeURIComponent("Join RAIZO GAMES - Fast PvP Casino Bot! 🎰")}`,
+        }],
       ],
     },
   });
