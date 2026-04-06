@@ -20,7 +20,7 @@ import {
 } from "./handlers/admin";
 import { acceptBet, cancelBet, expireOldBets } from "./services/gameService";
 import { processLockedStars } from "./services/depositService";
-import { adjustBalance, getUser } from "./services/userService";
+import { adjustBalance, getUser, getUserBalance } from "./services/userService";
 import { formatUSD, escapeHtml, b, i, code } from "./utils";
 import { query } from "./db";
 import { resolveGameByValues, formatDiceResult, telegramDiceEmoji } from "./games/engine";
@@ -551,8 +551,6 @@ export function initBot(): TelegramBot {
   // ─── PvP Accept Bet Helper ────────────────────────────────────────────────────
 
   async function handleAcceptBet(bot: TelegramBot, chatId: number, userId: number, betId: number): Promise<void> {
-    // Check balance before accepting
-    const { getUserBalance } = await import("./services/userService");
     const betRes0 = await query("SELECT * FROM game_bets WHERE id=$1 AND status='waiting'", [betId]);
     const pending = betRes0.rows[0];
     if (!pending) { await bot.sendMessage(chatId, "❌ Bet not found or already accepted."); return; }

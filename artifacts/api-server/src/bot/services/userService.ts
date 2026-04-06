@@ -1,4 +1,4 @@
-import { query } from "../db";
+import { query, withTransaction } from "../db";
 import { generateReferralCode } from "../utils";
 
 export interface BotUser {
@@ -94,37 +94,36 @@ export async function adjustBalance(
   description: string,
   refId?: string
 ): Promise<void> {
-  await query("BEGIN", []);
-  try {
-    const userRes = await query(
+  await withTransaction(async (client) => {
+    // Lock the row for this transaction only
+    const userRes = await client.query(
       "SELECT real_balance, bonus_balance FROM bot_users WHERE id = $1 FOR UPDATE",
       [userId]
     );
     const user = userRes.rows[0];
+    if (!user) throw new Error(`User ${userId} not found`);
+
     const newReal = parseFloat(user.real_balance) + realDelta;
     const newBonus = parseFloat(user.bonus_balance) + bonusDelta;
 
-    if (newReal < 0 || newBonus < 0) {
-      await query("ROLLBACK", []);
+    if (newReal < -0.0001 || newBonus < -0.0001) {
       throw new Error("Insufficient balance");
     }
 
-    await query(
+    const safeReal = Math.max(0, newReal);
+    const safeBonus = Math.max(0, newBonus);
+
+    await client.query(
       `UPDATE bot_users SET real_balance=$1, bonus_balance=$2, updated_at=NOW() WHERE id=$3`,
-      [newReal, newBonus, userId]
+      [safeReal, safeBonus, userId]
     );
 
-    await query(
+    await client.query(
       `INSERT INTO transactions (user_id, type, amount, balance_after, description, ref_id)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [userId, type, realDelta + bonusDelta, newReal + newBonus, description, refId || null]
+      [userId, type, realDelta + bonusDelta, safeReal + safeBonus, description, refId || null]
     );
-
-    await query("COMMIT", []);
-  } catch (err) {
-    await query("ROLLBACK", []);
-    throw err;
-  }
+  });
 }
 
 export async function addWagered(userId: number, amount: number): Promise<void> {
