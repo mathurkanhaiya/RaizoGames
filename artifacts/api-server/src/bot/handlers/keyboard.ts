@@ -70,9 +70,8 @@ export function betAmountKeyboard(gameType: string, mode: string): TelegramBot.I
 export function depositKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: "💵 USDT (Auto)", callback_data: "deposit_usdt" }],
-      [{ text: "⭐ Telegram Stars", callback_data: "deposit_stars" }],
-      [{ text: "⚡ TON Manual", callback_data: "deposit_ton" }],
+      [{ text: "💵 USDT (Auto · Instant)", callback_data: "deposit_usdt" }],
+      [{ text: "⭐ Telegram Stars (Instant)", callback_data: "deposit_stars" }],
       [{ text: "« Back", callback_data: "back_wallet" }],
     ],
   };

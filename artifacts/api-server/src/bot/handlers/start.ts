@@ -53,9 +53,8 @@ export async function handleStart(bot: TelegramBot, msg: TelegramBot.Message): P
         + `• ${b("vs Bot")} — Instant play, any time\n\n`
 
         + `💰 ${b("Deposits:")}\n`
-        + `• USDT (auto, instant) · Min $0.05\n`
-        + `• ⭐ Stars (21-day lock) · Min 5 Stars\n`
-        + `• TON (manual, with memo)\n\n`
+        + `• USDT (auto, instant) · Min $0.10\n`
+        + `• ⭐ Stars (instant) · Min 5 Stars\n\n`
 
         + `💸 ${b("Withdrawals:")} Min $0.50 · Auto-processed\n`
         + `👥 ${b("Referrals:")} Earn 5% on every friend's first deposit\n\n`

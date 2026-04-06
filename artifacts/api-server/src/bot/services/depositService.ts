@@ -117,24 +117,32 @@ export async function confirmOxaPayDeposit(
   return true;
 }
 
-// Record a real Telegram Stars (XTR) invoice payment — 21-day lock before credit
+// Record a real Telegram Stars (XTR) invoice payment — credited instantly
 export async function recordStarsDeposit(
   userId: number,
   starsCount: number,
   telegramChargeId?: string
-): Promise<{ lockedUntil: Date; usdAmount: number }> {
+): Promise<{ usdAmount: number }> {
   const usdAmount = starsCount * 0.01;
-  const lockedUntil = new Date(Date.now() + 21 * 24 * 60 * 60 * 1000);
 
-  // Use tx_hash to store the Telegram charge ID for refund purposes
   await query(
-    `INSERT INTO deposits (user_id, method, amount, usd_amount, status, stars_count, locked_until, tx_hash)
-     VALUES ($1, 'stars', $2, $2, 'pending', $3, $4, $5)
-     ON CONFLICT DO NOTHING`,
-    [userId, usdAmount, starsCount, lockedUntil, telegramChargeId || null]
+    `INSERT INTO deposits (user_id, method, amount, usd_amount, status, stars_count, tx_hash)
+     VALUES ($1, 'stars', $2, $2, 'confirmed', $3, $4)`,
+    [userId, usdAmount, starsCount, telegramChargeId || null]
   );
 
-  return { lockedUntil, usdAmount };
+  // Credit balance immediately
+  await adjustBalance(userId, usdAmount, 0, "deposit", `Stars deposit (${starsCount} ⭐)`, telegramChargeId);
+  await recordDeposit(usdAmount);
+
+  await query(
+    "UPDATE bot_users SET total_deposited = total_deposited + $1, updated_at=NOW() WHERE id=$2",
+    [usdAmount, userId]
+  );
+
+  await grantReferralOnDeposit(userId, usdAmount);
+
+  return { usdAmount };
 }
 
 // Refund Stars using the Telegram charge ID (admin action)

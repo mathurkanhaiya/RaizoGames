@@ -21,6 +21,15 @@ export async function canWithdraw(userId: number): Promise<{ ok: boolean; reason
   const user = await getUser(userId);
   if (!user) return { ok: false, reason: "User not found" };
 
+  // Must have at least one confirmed real deposit to withdraw
+  const depCheck = await query(
+    "SELECT 1 FROM deposits WHERE user_id=$1 AND status='confirmed' AND method != 'bonus' LIMIT 1",
+    [userId]
+  );
+  if (depCheck.rows.length === 0) {
+    return { ok: false, reason: "You must make at least one USDT or Stars deposit before withdrawing." };
+  }
+
   const minWithdraw = await getSettingNum("min_withdraw", 0.5);
 
   if (user.real_balance < minWithdraw) {

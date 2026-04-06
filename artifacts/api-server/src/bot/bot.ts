@@ -3,12 +3,14 @@ import { logger } from "../lib/logger";
 import { handleStart, handleHelp } from "./handlers/start";
 import { handleBalance, handleTransactionHistory } from "./handlers/balance";
 import {
-  handleDeposit, handleDepositUSDT, handleDepositTON, handleDepositStars,
+  handleDeposit, handleDepositUSDT, handleDepositStars,
   handleStarsCustomAmount, processUSDTDepositAmount, sendStarsInvoice,
-  handleSuccessfulStarsPayment, handlePendingStars, MIN_STARS
+  handleSuccessfulStarsPayment, MIN_STARS
 } from "./handlers/deposit";
 import { refundStarsByChargeId } from "./services/depositService";
 import { initLogService, sendGameLog } from "./services/logService";
+import { redeemCode, checkChannelSubscriptions, checkBotUsernameInProfile, createBonusCode } from "./services/redeemService";
+import { claimDaily, claimWeekly, formatTimeLeft, checkBotUsernameInProfile as checkBioForClaim } from "./services/dailyService";
 import { handleWithdraw, handleWithdrawUSDT, processWithdrawAmount, processWithdrawAddress } from "./handlers/withdraw";
 import { handlePlay, handleModeSelect, handleGameSelect, handleBetSelect, processBet, handleRPSChoice, handleQuickJoin, handleAcceptFromDeepLink, userState } from "./handlers/play";
 import { handleReferral } from "./handlers/referral";
@@ -21,7 +23,7 @@ import {
   handleAdminSetSetting, handleAdminRecentGames, handleAdminTopWinners
 } from "./handlers/admin";
 import { acceptBet, cancelBet, expireOldBets } from "./services/gameService";
-import { processLockedStars } from "./services/depositService";
+// processLockedStars removed — Stars now instant (no lock)
 import { adjustBalance, getUser, getUserBalance } from "./services/userService";
 import { formatUSD, escapeHtml, b, i, code } from "./utils";
 import { query } from "./db";
@@ -34,6 +36,7 @@ if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 const pendingWithdrawAmount = new Map<number, number>();
 const pendingAdminLookup = new Set<number>();
 const pendingStarsCustom = new Set<number>(); // users who clicked "Custom Amount" for Stars
+const pendingRedeem = new Set<number>();       // users waiting to enter a bonus code
 
 export function initBot(): TelegramBot {
   const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -57,11 +60,14 @@ export function initBot(): TelegramBot {
     { command: "help",        description: "📋 All commands & how to play" },
     { command: "play",        description: "🎮 Start a game" },
     { command: "balance",     description: "💰 Your wallet & balance" },
-    { command: "deposit",     description: "📥 Deposit USDT / Stars / TON" },
+    { command: "deposit",     description: "📥 Deposit USDT / Stars" },
     { command: "withdraw",    description: "💸 Withdraw your winnings" },
     { command: "leaderboard", description: "🏆 Top players leaderboard" },
     { command: "referral",    description: "👥 Refer friends & earn 5%" },
     { command: "tasks",       description: "📋 Daily tasks & bonus rewards" },
+    { command: "redeem",      description: "🎁 Redeem a bonus code" },
+    { command: "daily",       description: "🌞 Claim your daily bonus" },
+    { command: "weekly",      description: "📅 Claim your weekly bonus" },
     { command: "stats",       description: "📊 Your game statistics" },
     { command: "join",        description: "⚡ Browse open PvP bets" },
     { command: "support",     description: "💬 Contact support" },
@@ -83,6 +89,8 @@ export function initBot(): TelegramBot {
     { command: "removebalance", description: "➖ /removebalance userId amount" },
     { command: "ban",           description: "🚫 /ban userId" },
     { command: "refund",        description: "↩️ /refund <chargeId> — Refund Stars" },
+    { command: "createcode",    description: "🎁 /createcode <code> <amount> [maxuses]" },
+    { command: "listcodes",     description: "📋 List all bonus codes" },
   ], {
     scope: { type: "chat", chat_id: parseInt(process.env.ADMIN_TELEGRAM_ID || "2139807311") },
   }).catch(() => { /* admin may not have started the bot yet */ });
@@ -174,6 +182,100 @@ export function initBot(): TelegramBot {
     try { await handleQuickJoin(bot, msg.chat.id, msg.from!.id, gameType); } catch (e) { logger.error(e); }
   });
 
+  // /redeem — bonus code redemption
+  bot.onText(/\/redeem/, async (msg) => {
+    if (msg.chat.type !== "private") {
+      await bot.sendMessage(msg.chat.id, "🎁 Please use /redeem in private chat.");
+      return;
+    }
+    const userId = msg.from!.id;
+    const chatId = msg.chat.id;
+    pendingRedeem.add(userId);
+    await bot.sendMessage(chatId,
+      `🎁 ${b("Redeem Bonus Code")}\n\n`
+      + `Enter your bonus code below:\n\n`
+      + `${i("Requirements:\n• Must be subscribed to @RaizoGames & @RaizoGamesPvP\n• Bot username (@RaizoPvPBot) must appear in your name or bio")}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: { force_reply: true, input_field_placeholder: "Enter bonus code..." },
+      }
+    );
+  });
+
+  // /daily — daily bonus claim
+  bot.onText(/\/daily/, async (msg) => {
+    if (msg.chat.type !== "private") {
+      await bot.sendMessage(msg.chat.id, "🌞 Please use /daily in private chat.");
+      return;
+    }
+    const userId = msg.from!.id;
+    const chatId = msg.chat.id;
+    try {
+      const hasUsername = await checkBioForClaim(bot, userId);
+      if (!hasUsername) {
+        await bot.sendMessage(chatId,
+          `❌ ${b("Bio Requirement Not Met")}\n\n`
+          + `Add ${code("@RaizoPvPBot")} to your Telegram name or bio to claim daily bonuses.\n\n`
+          + `${i("After updating your profile, wait a few minutes then try again.")}`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+      const result = await claimDaily(userId);
+      if (!result.ok) {
+        await bot.sendMessage(chatId,
+          `⏳ ${b("Already Claimed")}\n\n`
+          + `You can claim your next daily bonus in:\n${b(formatTimeLeft(result.nextClaimMs!))}`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+      await bot.sendMessage(chatId,
+        `🌞 ${b("Daily Bonus Claimed!")}\n\n`
+        + `💰 You received: ${b("$" + result.amount!.toFixed(2))} bonus credit\n\n`
+        + `${i("Come back in 24 hours for your next claim!")}`,
+        { parse_mode: "HTML" }
+      );
+    } catch (e) { logger.error(e); }
+  });
+
+  // /weekly — weekly bonus claim
+  bot.onText(/\/weekly/, async (msg) => {
+    if (msg.chat.type !== "private") {
+      await bot.sendMessage(msg.chat.id, "📅 Please use /weekly in private chat.");
+      return;
+    }
+    const userId = msg.from!.id;
+    const chatId = msg.chat.id;
+    try {
+      const hasUsername = await checkBioForClaim(bot, userId);
+      if (!hasUsername) {
+        await bot.sendMessage(chatId,
+          `❌ ${b("Bio Requirement Not Met")}\n\n`
+          + `Add ${code("@RaizoPvPBot")} to your Telegram name or bio to claim weekly bonuses.\n\n`
+          + `${i("After updating your profile, wait a few minutes then try again.")}`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+      const result = await claimWeekly(userId);
+      if (!result.ok) {
+        await bot.sendMessage(chatId,
+          `⏳ ${b("Already Claimed")}\n\n`
+          + `You can claim your next weekly bonus in:\n${b(formatTimeLeft(result.nextClaimMs!))}`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+      await bot.sendMessage(chatId,
+        `📅 ${b("Weekly Bonus Claimed!")}\n\n`
+        + `💰 You received: ${b("$" + result.amount!.toFixed(2))} bonus credit\n\n`
+        + `${i("Come back in 7 days for your next weekly bonus!")}`,
+        { parse_mode: "HTML" }
+      );
+    } catch (e) { logger.error(e); }
+  });
+
   // Quick bet: /bet dice 0.5
   bot.onText(/\/bet (.+) (.+)/, async (msg, match) => {
     const gameType = match![1].toLowerCase();
@@ -233,6 +335,60 @@ export function initBot(): TelegramBot {
   bot.onText(/\/ban (\d+)/, async (msg, match) => {
     if (!isAdmin(msg.from!.id)) return;
     try { await handleAdminBanUser(bot, msg.chat.id, parseInt(match![1])); } catch (e) { logger.error(e); }
+  });
+
+  // Admin: create bonus code — /createcode <CODE> <amount> [maxuses]
+  bot.onText(/\/createcode (.+)/, async (msg, match) => {
+    if (!isAdmin(msg.from!.id)) return;
+    const chatId = msg.chat.id;
+    const parts = match![1].trim().split(/\s+/);
+    if (parts.length < 2) {
+      await bot.sendMessage(chatId,
+        `Usage: ${code("/createcode CODE AMOUNT [MAX_USES]")}\n\nExample:\n${code("/createcode WELCOME25 0.25 100")}`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    const codeStr = parts[0].toUpperCase();
+    const amount = parseFloat(parts[1]);
+    const maxUses = parts[2] ? parseInt(parts[2]) : 1;
+    if (isNaN(amount) || amount <= 0) {
+      await bot.sendMessage(chatId, "❌ Invalid amount.");
+      return;
+    }
+    const bc = await createBonusCode(codeStr, amount, maxUses, msg.from!.id);
+    if (!bc) {
+      await bot.sendMessage(chatId,
+        `❌ Code ${code(codeStr)} already exists. Use a different code name.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    await bot.sendMessage(chatId,
+      `✅ ${b("Bonus Code Created!")}\n\n`
+      + `🎁 Code: ${code(bc.code)}\n`
+      + `💰 Amount: $${Number(bc.amount).toFixed(2)}\n`
+      + `♻️ Max Uses: ${bc.max_uses}\n`
+      + `📊 Uses: 0 / ${bc.max_uses}`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // Admin: list bonus codes
+  bot.onText(/\/listcodes/, async (msg) => {
+    if (!isAdmin(msg.from!.id)) return;
+    const { getBonusCodes } = await import("./services/redeemService");
+    const codes = await getBonusCodes();
+    if (!codes.length) {
+      await bot.sendMessage(msg.chat.id, "No bonus codes created yet.");
+      return;
+    }
+    let text = `🎁 ${b("Bonus Codes")}\n\n`;
+    for (const c of codes) {
+      const expired = c.expires_at && new Date(c.expires_at) < new Date() ? " ⚠️EXPIRED" : "";
+      text += `${code(c.code)} — $${Number(c.amount).toFixed(2)} — ${c.uses_count}/${c.max_uses} uses${expired}\n`;
+    }
+    await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
   });
 
   // Refund Stars — two forms:
@@ -451,6 +607,51 @@ export function initBot(): TelegramBot {
       return;
     }
 
+    // ── Redeem bonus code (pendingRedeem state or force_reply) ─────────────────
+    if (pendingRedeem.has(userId) ||
+        msg.reply_to_message?.text?.includes("bonus code") ||
+        msg.reply_to_message?.text?.includes("Enter your bonus code")) {
+      pendingRedeem.delete(userId);
+      try {
+        // Check channel subscriptions first
+        const subCheck = await checkChannelSubscriptions(bot, userId);
+        if (!subCheck.ok) {
+          await bot.sendMessage(chatId,
+            `❌ ${b("Not Subscribed!")}\n\n`
+            + `You must join these channels before redeeming:\n`
+            + subCheck.missing.map(c => `• ${c}`).join("\n") + "\n\n"
+            + `After joining, try /redeem again.`,
+            { parse_mode: "HTML" }
+          );
+          return;
+        }
+        // Check bot username in profile
+        const hasUsername = await checkBotUsernameInProfile(bot, userId);
+        if (!hasUsername) {
+          await bot.sendMessage(chatId,
+            `❌ ${b("Bio Requirement Not Met!")}\n\n`
+            + `Add ${code("@RaizoPvPBot")} to your Telegram name or bio, then try again.\n\n`
+            + `${i("After updating, wait a few minutes and use /redeem again.")}`,
+            { parse_mode: "HTML" }
+          );
+          return;
+        }
+        // Redeem the code
+        const result = await redeemCode(userId, text);
+        if (!result.ok) {
+          await bot.sendMessage(chatId, `❌ ${result.reason}`);
+          return;
+        }
+        await bot.sendMessage(chatId,
+          `✅ ${b("Code Redeemed!")}\n\n`
+          + `🎁 ${b("+" + "$" + result.amount!.toFixed(2))} has been added to your bonus balance!\n\n`
+          + `${i("Bonus balance can be used for bets. Deposit to unlock withdrawals.")}`,
+          { parse_mode: "HTML" }
+        );
+      } catch (e) { logger.error(e); }
+      return;
+    }
+
     // USDT deposit amount via force_reply
     if (msg.reply_to_message?.text?.includes("amount in USD") ||
         msg.reply_to_message?.text?.includes("deposit in USD")) {
@@ -514,11 +715,6 @@ export function initBot(): TelegramBot {
   setInterval(async () => {
     try { await expireOldBets(); } catch { /* ignore */ }
   }, 60 * 1000);
-
-  // Unlock Stars deposits every hour
-  setInterval(async () => {
-    try { await processLockedStars(); } catch { /* ignore */ }
-  }, 60 * 60 * 1000);
 
   // Expire newbie bonuses daily
   setInterval(async () => {
@@ -624,10 +820,8 @@ export function initBot(): TelegramBot {
     if (data === "wallet_deposit")      { await handleDeposit(bot, chatId, userId); return; }
     if (data === "wallet_withdraw")     { await handleWithdraw(bot, chatId, userId); return; }
     if (data === "wallet_transactions") { await handleTransactionHistory(bot, chatId, userId); return; }
-    if (data === "wallet_pending_stars"){ await handlePendingStars(bot, chatId, userId); return; }
     if (data === "deposit_usdt")        { await handleDepositUSDT(bot, chatId, userId); return; }
     if (data === "deposit_stars")       { await handleDepositStars(bot, chatId, userId); return; }
-    if (data === "deposit_ton")         { await handleDepositTON(bot, chatId, userId); return; }
     if (data === "withdraw_usdt")       { await handleWithdrawUSDT(bot, chatId, userId); return; }
 
     if (data === "withdraw_history") {

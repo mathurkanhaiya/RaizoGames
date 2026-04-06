@@ -1,18 +1,16 @@
 import TelegramBot from "node-telegram-bot-api";
-import { createOxaPayInvoice, recordStarsDeposit, getPendingStars } from "../services/depositService";
-import { formatUSD, formatDate, b, i, code } from "../utils";
+import { createOxaPayInvoice, recordStarsDeposit } from "../services/depositService";
+import { formatUSD, b, i, code } from "../utils";
 import { depositKeyboard } from "./keyboard";
 
-const TON_WALLET = process.env.TON_WALLET || "UQDqFSJ_gNtlwbRPmoJmEbJ4yxomqJNSJzDWdI6Dg-pQRNzL";
 export const MIN_STARS = 5;
 export const MIN_DEPOSIT_USD = 0.10;
 
 export async function handleDeposit(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const text = `📥 ${b("Deposit Funds")}\n\n`
-    + `Choose your preferred deposit method:\n\n`
-    + `💵 ${b("USDT")} — Automatic, instant credit\n`
-    + `⭐ ${b("Stars")} — 1 ⭐ = $0.01, 21-day lock\n`
-    + `⚡ ${b("TON")} — Manual, requires comment\n\n`
+    + `Choose your deposit method:\n\n`
+    + `💵 ${b("USDT")} — Automatic · Instant credit\n`
+    + `⭐ ${b("Stars")} — 1 ⭐ = $0.01 · Instant credit\n\n`
     + `${i("Min deposit: $" + MIN_DEPOSIT_USD.toFixed(2) + " USDT | " + MIN_STARS + " Stars")}`;
 
   await bot.sendMessage(chatId, text, {
@@ -47,7 +45,7 @@ export async function processUSDTDepositAmount(bot: TelegramBot, chatId: number,
   const invoice = await createOxaPayInvoice(userId, amount);
   if (!invoice) {
     await bot.sendMessage(chatId,
-      `❌ ${b("Failed to create invoice")}\n\nThe payment gateway rejected this amount (minimum may be higher).\n\nTry a higher amount or contact @RaizoGamesSupport for help.`,
+      `❌ ${b("Failed to create invoice")}\n\nThe payment gateway rejected this request.\n\nTry a higher amount or contact @RaizoGamesSupport for help.`,
       { parse_mode: "HTML" }
     );
     return;
@@ -72,32 +70,11 @@ export async function processUSDTDepositAmount(bot: TelegramBot, chatId: number,
   });
 }
 
-export async function handleDepositTON(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
-  const text = `⚡ ${b("TON Deposit")}\n\n`
-    + `Send TON to the following address:\n\n`
-    + `${code(TON_WALLET)}\n\n`
-    + `⚠️ ${b("IMPORTANT:")} Include your User ID as the comment/memo:\n`
-    + `${code(String(userId))}\n\n`
-    + `📋 Conversion rate updated daily\n`
-    + `⏱ Auto-credited within 1-3 blockchain confirmations\n\n`
-    + `${i("Without the correct comment, your deposit cannot be tracked!")}`;
-
-  await bot.sendMessage(chatId, text, {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "« Back", callback_data: "wallet_deposit" }],
-      ],
-    },
-  });
-}
-
 export async function handleDepositStars(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const text = `⭐ ${b("Telegram Stars Deposit")}\n\n`
     + `• 1 ⭐ = $0.01 USD\n`
     + `• Minimum: ${MIN_STARS} Stars ($${(MIN_STARS * 0.01).toFixed(2)})\n`
-    + `• 🔒 21-Day Lock — credited after 21 days\n`
-    + `• Anti-scam protection enabled\n\n`
+    + `• ✅ Instant credit — no waiting period\n\n`
     + `Choose a preset or enter a custom amount:`;
 
   await bot.sendMessage(chatId, text, {
@@ -121,7 +98,6 @@ export async function handleDepositStars(bot: TelegramBot, chatId: number, userI
   });
 }
 
-// Prompt user to type a custom Stars amount
 export async function handleStarsCustomAmount(bot: TelegramBot, chatId: number): Promise<void> {
   await bot.sendMessage(chatId,
     `⭐ ${b("Custom Stars Amount")}\n\nEnter the number of Stars to deposit:\n${i("Min: " + MIN_STARS + " Stars")}`,
@@ -132,7 +108,6 @@ export async function handleStarsCustomAmount(bot: TelegramBot, chatId: number):
   );
 }
 
-// Send a real Telegram Stars (XTR) invoice
 export async function sendStarsInvoice(bot: TelegramBot, chatId: number, userId: number, starsCount: number): Promise<void> {
   if (starsCount < MIN_STARS) {
     await bot.sendMessage(chatId, `❌ Minimum is ${MIN_STARS} Stars.`);
@@ -146,12 +121,10 @@ export async function sendStarsInvoice(bot: TelegramBot, chatId: number, userId:
     await bot.sendInvoice(
       chatId,
       "⭐ RAIZO GAMES — Stars Deposit",
-      `Deposit ${starsCount} Telegram Stars to your RAIZO GAMES balance.\n\n` +
-        `Value: $${usdValue.toFixed(2)} USD\n` +
-        `⚠️ 21-day lock applies before funds are credited.`,
+      `Deposit ${starsCount} Telegram Stars to your RAIZO GAMES balance.\n\nValue: $${usdValue.toFixed(2)} USD\n✅ Instant credit after payment.`,
       payload,
       "",    // provider_token — empty for XTR (Stars)
-      "XTR", // currency = Telegram Stars
+      "XTR",
       [{ label: `${starsCount} Stars Deposit`, amount: starsCount }]
     );
   } catch (err) {
@@ -167,7 +140,6 @@ export async function handleSuccessfulStarsPayment(
   payload: string,
   telegramPaymentChargeId: string
 ): Promise<void> {
-  // payload format: stars_userId_starsCount_timestamp
   const parts = payload.split("_");
   if (parts.length < 3 || parts[0] !== "stars") return;
 
@@ -177,30 +149,9 @@ export async function handleSuccessfulStarsPayment(
   const result = await recordStarsDeposit(userId, starsCount, telegramPaymentChargeId);
 
   const text = `✅ ${b("Stars Payment Received!")}\n\n`
-    + `• Stars: ${starsCount} ⭐\n`
-    + `• USD Value: ${formatUSD(result.usdAmount)}\n`
-    + `• 🔒 Credited on: ${i(formatDate(result.lockedUntil))}\n\n`
-    + `Your balance will be credited automatically after the 21-day lock period.\n`
-    + `Check /balance to see pending Stars deposits.`;
-
-  await bot.sendMessage(chatId, text, { parse_mode: "HTML" });
-}
-
-export async function handlePendingStars(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
-  const pending = await getPendingStars(userId);
-
-  if (pending.length === 0) {
-    await bot.sendMessage(chatId, "⭐ No pending Stars deposits.");
-    return;
-  }
-
-  let text = `⭐ ${b("Pending Stars Deposits")}\n\n`;
-  for (const dep of pending) {
-    const timeLeft = new Date(dep.locked_until!).getTime() - Date.now();
-    const daysLeft = Math.max(0, Math.ceil(timeLeft / (24 * 60 * 60 * 1000)));
-    text += `• ${dep.stars_count} ⭐ = ${formatUSD(parseFloat(String(dep.usd_amount)))}\n`;
-    text += `  Unlocks in: ${b(daysLeft + " days")}\n\n`;
-  }
+    + `⭐ Stars: ${starsCount}\n`
+    + `💰 Credited: ${formatUSD(result.usdAmount)}\n\n`
+    + `Your balance has been updated instantly. Use /balance to check.`;
 
   await bot.sendMessage(chatId, text, { parse_mode: "HTML" });
 }
