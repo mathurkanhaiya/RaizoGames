@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-24", "postgresql-16"]
 
 [[artifacts]]
 id = "artifacts/api-server"
@@ -24,3 +24,14 @@ expertMode = true
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 20000
+
+[userenv]
+
+[userenv.shared]
+TELEGRAM_BOT_TOKEN = "8661200278:AAFiIkvP-twQK_fU0mIsvcP3udpEN9Nuhp8"
+OXAPAY_API_KEY = "SFY4IR-6GW5ZQ-VQSEWF-BBKHOB"
+ADMIN_TELEGRAM_ID = "2139807311"
+TON_WALLET = "UQDqFSJ_gNtlwbRPmoJmEbJ4yxomqJNSJzDWdI6Dg-pQRNzL"
+
+[nix]
+channel = "stable-25_05"
