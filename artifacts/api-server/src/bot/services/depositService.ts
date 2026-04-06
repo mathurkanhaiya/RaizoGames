@@ -39,6 +39,8 @@ export async function createOxaPayInvoice(
     ? `${process.env.WEBHOOK_URL}/api/webhook/oxapay`
     : "";
 
+  console.log(`[OxaPay] Creating invoice — user: ${userId}, amount: $${amountUSD}, keySet: ${!!OXAPAY_MERCHANT_KEY}, keyLen: ${OXAPAY_MERCHANT_KEY.length}`);
+
   try {
     // OxaPay Merchant API: key goes in the body as "merchant"
     const response = await axios.post(
@@ -59,6 +61,8 @@ export async function createOxaPayInvoice(
     );
 
     const data = response.data;
+    console.log(`[OxaPay] Response: result=${data?.result}, message=${data?.message}, hasPayLink=${!!data?.payLink}`);
+
     // OxaPay result 100 = success
     if (data?.result === 100 && data?.payLink) {
       const trackId: string = data.trackId || orderId;
@@ -67,18 +71,18 @@ export async function createOxaPayInvoice(
          VALUES ($1, 'usdt', $2, $2, 'pending', $3)`,
         [userId, amountUSD, trackId]
       );
+      console.log(`[OxaPay] Invoice created — trackId: ${trackId}`);
       return { payUrl: data.payLink, orderId: trackId };
     }
 
-    // Log full response including result code and message so we can debug
-    console.error(`OxaPay error — result: ${data?.result}, message: ${data?.message}`);
+    console.error(`[OxaPay] Failed — result: ${data?.result}, message: ${data?.message}`);
     return null;
   } catch (err: unknown) {
     if (err && typeof err === "object" && "response" in err) {
       const axErr = err as { response?: { status?: number; data?: unknown }; message?: string };
-      console.error("OxaPay API error:", axErr.response?.status, JSON.stringify(axErr.response?.data));
+      console.error("[OxaPay] API error:", axErr.response?.status, JSON.stringify(axErr.response?.data));
     } else {
-      console.error("OxaPay request failed:", err instanceof Error ? err.message : String(err));
+      console.error("[OxaPay] Request failed:", err instanceof Error ? err.message : String(err));
     }
     return null;
   }

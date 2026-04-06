@@ -5,7 +5,7 @@ import { depositKeyboard } from "./keyboard";
 
 const TON_WALLET = process.env.TON_WALLET || "UQDqFSJ_gNtlwbRPmoJmEbJ4yxomqJNSJzDWdI6Dg-pQRNzL";
 export const MIN_STARS = 5;
-export const MIN_DEPOSIT_USD = 0.05;
+export const MIN_DEPOSIT_USD = 1.00; // OxaPay minimum is $1.00 USDT
 
 export async function handleDeposit(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const text = `📥 ${b("Deposit Funds")}\n\n`
@@ -23,10 +23,10 @@ export async function handleDeposit(bot: TelegramBot, chatId: number, userId: nu
 
 export async function handleDepositUSDT(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   await bot.sendMessage(chatId,
-    `💵 ${b("USDT Deposit")}\n\nEnter the amount in USD you want to deposit:\n${i("Min: $" + MIN_DEPOSIT_USD + " — Example: 0.05, 1, 10, 50")}`,
+    `💵 ${b("USDT Deposit")}\n\nEnter the amount in USD you want to deposit:\n${i("Min: $" + MIN_DEPOSIT_USD + " — Example: 1, 5, 10, 50")}`,
     {
       parse_mode: "HTML",
-      reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD (min $0.05)" },
+      reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD (min $1.00)" },
     }
   );
 }
@@ -34,7 +34,7 @@ export async function handleDepositUSDT(bot: TelegramBot, chatId: number, userId
 export async function processUSDTDepositAmount(bot: TelegramBot, chatId: number, userId: number, amountStr: string): Promise<void> {
   const amount = parseFloat(amountStr);
   if (isNaN(amount) || amount < MIN_DEPOSIT_USD) {
-    await bot.sendMessage(chatId, `❌ Minimum deposit is $${MIN_DEPOSIT_USD}. Please enter a valid amount.`);
+    await bot.sendMessage(chatId, `❌ Minimum USDT deposit is $${MIN_DEPOSIT_USD.toFixed(2)}. Please enter a valid amount.`);
     return;
   }
   if (amount > 10000) {
@@ -42,11 +42,14 @@ export async function processUSDTDepositAmount(bot: TelegramBot, chatId: number,
     return;
   }
 
-  await bot.sendMessage(chatId, "⏳ Generating payment link...");
+  await bot.sendMessage(chatId, "⏳ Generating your payment link...");
 
   const invoice = await createOxaPayInvoice(userId, amount);
   if (!invoice) {
-    await bot.sendMessage(chatId, "❌ Failed to create invoice. Please try again later.");
+    await bot.sendMessage(chatId,
+      `❌ ${b("Failed to create invoice")}\n\nPossible reasons:\n• Amount below OxaPay minimum ($1.00)\n• Payment gateway temporarily unavailable\n\nPlease try again or contact support.`,
+      { parse_mode: "HTML" }
+    );
     return;
   }
 
