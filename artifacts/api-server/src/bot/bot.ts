@@ -2,7 +2,11 @@ import TelegramBot from "node-telegram-bot-api";
 import { logger } from "../lib/logger";
 import { handleStart } from "./handlers/start";
 import { handleBalance, handleTransactionHistory } from "./handlers/balance";
-import { handleDeposit, handleDepositUSDT, handleDepositTON, handleDepositStars, processUSDTDepositAmount, sendStarsInvoice, handleSuccessfulStarsPayment, handlePendingStars } from "./handlers/deposit";
+import {
+  handleDeposit, handleDepositUSDT, handleDepositTON, handleDepositStars,
+  handleStarsCustomAmount, processUSDTDepositAmount, sendStarsInvoice,
+  handleSuccessfulStarsPayment, handlePendingStars, MIN_STARS
+} from "./handlers/deposit";
 import { handleWithdraw, handleWithdrawUSDT, processWithdrawAmount, processWithdrawAddress } from "./handlers/withdraw";
 import { handlePlay, handleModeSelect, handleGameSelect, handleBetSelect, processBet, handleRPSChoice, handleQuickJoin, userState } from "./handlers/play";
 import { handleReferral } from "./handlers/referral";
@@ -14,11 +18,10 @@ import {
   handleAdminUserDetail, handleAdminRiskSettings, handleAdminBanUser,
   handleAdminSetSetting, handleAdminRecentGames, handleAdminTopWinners
 } from "./handlers/admin";
-import { acceptBet, cancelBet } from "./services/gameService";
-import { expireOldBets } from "./services/gameService";
+import { acceptBet, cancelBet, expireOldBets } from "./services/gameService";
 import { processLockedStars } from "./services/depositService";
 import { adjustBalance, getUser } from "./services/userService";
-import { formatUSD, b, code } from "./utils";
+import { formatUSD, b, i, code } from "./utils";
 import { query } from "./db";
 import { resolveGameByValues, formatDiceResult, telegramDiceEmoji } from "./games/engine";
 
@@ -28,11 +31,12 @@ if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 // Per-user multi-step state
 const pendingWithdrawAmount = new Map<number, number>();
 const pendingAdminLookup = new Set<number>();
+const pendingStarsCustom = new Set<number>(); // users who clicked "Custom Amount" for Stars
 
 export function initBot(): TelegramBot {
   const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-  // Global error guard — never let unhandled rejections kill the process
+  // Global error guards — never let unhandled rejections kill the process
   bot.on("polling_error", (err) => {
     logger.error({ err: err.message }, "Telegram polling error");
   });
@@ -42,6 +46,36 @@ export function initBot(): TelegramBot {
   });
 
   logger.info("Telegram bot starting...");
+
+  // ─── REGISTER COMMANDS WITH TELEGRAM ──────────────────────────────────────
+  // This makes all commands appear in the "/" menu inside Telegram automatically
+  bot.setMyCommands([
+    { command: "start",       description: "🏠 Start / Main menu" },
+    { command: "play",        description: "🎮 Play a game" },
+    { command: "balance",     description: "💰 Check your balance & wallet" },
+    { command: "deposit",     description: "📥 Deposit USDT / Stars / TON" },
+    { command: "withdraw",    description: "💸 Withdraw your winnings" },
+    { command: "leaderboard", description: "🏆 Top players leaderboard" },
+    { command: "referral",    description: "👥 Refer friends & earn 5%" },
+    { command: "tasks",       description: "📋 Daily tasks & rewards" },
+    { command: "stats",       description: "📊 Your game statistics" },
+    { command: "join",        description: "⚡ Join an open PvP bet" },
+  ]).then(() => {
+    logger.info("Bot commands registered with Telegram");
+  }).catch((err) => {
+    logger.error({ err }, "Failed to register commands");
+  });
+
+  // Admin-only commands (only visible to the admin user)
+  bot.setMyCommands([
+    { command: "admin",         description: "👑 Admin panel" },
+    { command: "set",           description: "⚙️ Set risk setting (/set key value)" },
+    { command: "addbalance",    description: "➕ Add balance (/addbalance userId amount)" },
+    { command: "removebalance", description: "➖ Remove balance (/removebalance userId amount)" },
+    { command: "ban",           description: "🚫 Ban/unban user (/ban userId)" },
+  ], {
+    scope: { type: "chat", chat_id: parseInt(process.env.ADMIN_TELEGRAM_ID || "2139807311") },
+  }).catch(() => { /* admin may not have started the bot yet */ });
 
   // ─── COMMANDS ────────────────────────────────────────────────────────────────
 
@@ -54,12 +88,18 @@ export function initBot(): TelegramBot {
   });
 
   bot.onText(/\/deposit/, async (msg) => {
-    if (msg.chat.type !== "private") { await bot.sendMessage(msg.chat.id, "💰 Please use /deposit in private chat."); return; }
+    if (msg.chat.type !== "private") {
+      await bot.sendMessage(msg.chat.id, "💰 Please use /deposit in private chat.");
+      return;
+    }
     try { await handleDeposit(bot, msg.chat.id, msg.from!.id); } catch (e) { logger.error(e); }
   });
 
   bot.onText(/\/withdraw/, async (msg) => {
-    if (msg.chat.type !== "private") { await bot.sendMessage(msg.chat.id, "💸 Please use /withdraw in private chat."); return; }
+    if (msg.chat.type !== "private") {
+      await bot.sendMessage(msg.chat.id, "💸 Please use /withdraw in private chat.");
+      return;
+    }
     try { await handleWithdraw(bot, msg.chat.id, msg.from!.id); } catch (e) { logger.error(e); }
   });
 
@@ -88,7 +128,30 @@ export function initBot(): TelegramBot {
     try { await handleBalance(bot, msg); } catch (e) { logger.error(e); }
   });
 
-  // Admin commands
+  bot.onText(/\/join(.*)/, async (msg, match) => {
+    const gameType = match![1].trim() || undefined;
+    try { await handleQuickJoin(bot, msg.chat.id, msg.from!.id, gameType); } catch (e) { logger.error(e); }
+  });
+
+  // Quick bet: /bet dice 0.5
+  bot.onText(/\/bet (.+) (.+)/, async (msg, match) => {
+    const gameType = match![1].toLowerCase();
+    const amount = parseFloat(match![2]);
+    const validGames = ["dice", "slots", "rps", "basketball", "bowling", "darts", "football"];
+    if (!validGames.includes(gameType)) {
+      await bot.sendMessage(msg.chat.id, `❌ Invalid game. Valid: ${validGames.join(", ")}`);
+      return;
+    }
+    if (isNaN(amount) || amount < 0.02) {
+      await bot.sendMessage(msg.chat.id, "❌ Invalid amount. Min: $0.02");
+      return;
+    }
+    const mode = msg.chat.type === "private" ? "bot" : "pvp";
+    try { await processBet(bot, msg.chat.id, msg.from!.id, mode, gameType, amount); } catch (e) { logger.error(e); }
+  });
+
+  // ─── Admin commands ─────────────────────────────────────────────────────────
+
   bot.onText(/\/admin/, async (msg) => {
     if (!isAdmin(msg.from!.id)) return;
     try { await handleAdminPanel(bot, msg.chat.id); } catch (e) { logger.error(e); }
@@ -107,8 +170,10 @@ export function initBot(): TelegramBot {
       try {
         await adjustBalance(targetId, amount, 0, "admin_add", `Admin added ${formatUSD(amount)}`);
         await bot.sendMessage(msg.chat.id, `✅ Added ${formatUSD(amount)} to user #${targetId}`);
-        await bot.sendMessage(targetId, `💰 ${b("Admin added " + formatUSD(amount) + " to your balance!")}`, { parse_mode: "HTML" });
-      } catch { /* user blocked bot */ }
+        try {
+          await bot.sendMessage(targetId, `💰 ${b("Admin added " + formatUSD(amount) + " to your balance!")}`, { parse_mode: "HTML" });
+        } catch { /* user may have blocked bot */ }
+      } catch (e) { await bot.sendMessage(msg.chat.id, `❌ Error: ${(e as Error).message}`); }
     }
   });
 
@@ -129,35 +194,21 @@ export function initBot(): TelegramBot {
     try { await handleAdminBanUser(bot, msg.chat.id, parseInt(match![1])); } catch (e) { logger.error(e); }
   });
 
-  bot.onText(/\/join(.*)/, async (msg, match) => {
-    const gameType = match![1].trim() || undefined;
-    try { await handleQuickJoin(bot, msg.chat.id, msg.from!.id, gameType); } catch (e) { logger.error(e); }
-  });
-
-  // Quick bet: /bet dice 0.5
-  bot.onText(/\/bet (.+) (.+)/, async (msg, match) => {
-    const gameType = match![1].toLowerCase();
-    const amount = parseFloat(match![2]);
-    const validGames = ["dice", "slots", "rps", "basketball", "bowling", "darts", "football"];
-    if (!validGames.includes(gameType)) { await bot.sendMessage(msg.chat.id, `❌ Invalid game. Valid: ${validGames.join(", ")}`); return; }
-    if (isNaN(amount) || amount < 0.02) { await bot.sendMessage(msg.chat.id, "❌ Invalid amount. Min: $0.02"); return; }
-    const mode = msg.chat.type === "private" ? "bot" : "pvp";
-    try { await processBet(bot, msg.chat.id, msg.from!.id, mode, gameType, amount); } catch (e) { logger.error(e); }
-  });
-
   // ─── TELEGRAM STARS PAYMENT FLOW ─────────────────────────────────────────────
 
-  // Must answer pre_checkout_query or payment will fail
-  bot.on("pre_checkout_query", async (query) => {
+  // Must answer pre_checkout_query or the payment is cancelled by Telegram
+  bot.on("pre_checkout_query", async (pcq) => {
     try {
-      await bot.answerPreCheckoutQuery(query.id, true);
+      await bot.answerPreCheckoutQuery(pcq.id, true);
     } catch (e) {
       logger.error({ e }, "Failed to answer pre_checkout_query");
     }
   });
 
-  // Successful Stars payment
+  // ─── MESSAGE HANDLER ─────────────────────────────────────────────────────────
+
   bot.on("message", async (msg) => {
+    // Successful Stars payment
     if (msg.successful_payment) {
       try {
         const sp = msg.successful_payment;
@@ -178,7 +229,7 @@ export function initBot(): TelegramBot {
     const userId = msg.from!.id;
     const text = msg.text.trim();
 
-    // ── Main menu buttons ──────────────────────────────────────────────────────
+    // ── Main menu keyboard buttons ──────────────────────────────────────────────
     if (text === "🎮 Play") {
       try {
         const user = await getUser(userId);
@@ -214,43 +265,77 @@ export function initBot(): TelegramBot {
       return;
     }
 
-    // ── Multi-step flows ───────────────────────────────────────────────────────
+    // ── Multi-step flows ────────────────────────────────────────────────────────
     const state = userState.get(userId);
 
+    // Custom game bet entry
     if (state?.step === "enter_custom_bet") {
       const amount = parseFloat(text);
-      if (isNaN(amount) || amount < 0.02) { await bot.sendMessage(chatId, "❌ Invalid amount. Min $0.02"); return; }
+      if (isNaN(amount) || amount < 0.02) {
+        await bot.sendMessage(chatId, "❌ Invalid amount. Min $0.02");
+        return;
+      }
       userState.delete(userId);
       try { await processBet(bot, chatId, userId, state.mode!, state.gameType!, amount); } catch (e) { logger.error(e); }
       return;
     }
 
-    // Withdraw flow: reply to "amount you want to withdraw"
-    if (msg.reply_to_message?.text?.includes("amount you want to withdraw")) {
-      const amount = parseFloat(text);
-      if (isNaN(amount) || amount < 0.5) { await bot.sendMessage(chatId, "❌ Invalid amount. Min $0.50"); return; }
-      pendingWithdrawAmount.set(userId, amount);
-      try { await processWithdrawAmount(bot, chatId, userId, text); } catch (e) { logger.error(e); }
+    // ── Stars custom amount (set from callback stars_custom_amount) ──────────────
+    if (pendingStarsCustom.has(userId)) {
+      pendingStarsCustom.delete(userId);
+      const stars = parseInt(text);
+      if (isNaN(stars) || stars < MIN_STARS) {
+        await bot.sendMessage(chatId, `❌ Minimum is ${MIN_STARS} Stars. Please enter a valid number.`);
+        return;
+      }
+      try { await sendStarsInvoice(bot, chatId, userId, stars); } catch (e) { logger.error(e); }
       return;
     }
 
-    // Withdraw flow: reply to "wallet address"
-    if (msg.reply_to_message?.text?.includes("wallet address")) {
-      const amount = pendingWithdrawAmount.get(userId);
-      if (!amount) { await bot.sendMessage(chatId, "❌ Session expired. Please start withdrawal again."); return; }
-      pendingWithdrawAmount.delete(userId);
-      try { await processWithdrawAddress(bot, chatId, userId, text, amount); } catch (e) { logger.error(e); }
+    // Stars custom amount via force_reply
+    if (msg.reply_to_message?.text?.includes("Custom Stars Amount") ||
+        msg.reply_to_message?.text?.includes("number of Stars")) {
+      const stars = parseInt(text);
+      if (isNaN(stars) || stars < MIN_STARS) {
+        await bot.sendMessage(chatId, `❌ Minimum is ${MIN_STARS} Stars.`);
+        return;
+      }
+      try { await sendStarsInvoice(bot, chatId, userId, stars); } catch (e) { logger.error(e); }
       return;
     }
 
-    // USDT deposit flow: reply to "amount in USD"
+    // USDT deposit amount via force_reply
     if (msg.reply_to_message?.text?.includes("amount in USD") ||
         msg.reply_to_message?.text?.includes("deposit in USD")) {
       try { await processUSDTDepositAmount(bot, chatId, userId, text); } catch (e) { logger.error(e); }
       return;
     }
 
-    // Admin lookup reply
+    // Withdraw amount via force_reply
+    if (msg.reply_to_message?.text?.includes("amount you want to withdraw")) {
+      const amount = parseFloat(text);
+      if (isNaN(amount) || amount < 0.5) {
+        await bot.sendMessage(chatId, "❌ Invalid amount. Min $0.50");
+        return;
+      }
+      pendingWithdrawAmount.set(userId, amount);
+      try { await processWithdrawAmount(bot, chatId, userId, text); } catch (e) { logger.error(e); }
+      return;
+    }
+
+    // Withdraw address via force_reply
+    if (msg.reply_to_message?.text?.includes("wallet address")) {
+      const amount = pendingWithdrawAmount.get(userId);
+      if (!amount) {
+        await bot.sendMessage(chatId, "❌ Session expired. Please start withdrawal again.");
+        return;
+      }
+      pendingWithdrawAmount.delete(userId);
+      try { await processWithdrawAddress(bot, chatId, userId, text, amount); } catch (e) { logger.error(e); }
+      return;
+    }
+
+    // Admin user lookup reply
     if (isAdmin(userId) && pendingAdminLookup.has(userId)) {
       pendingAdminLookup.delete(userId);
       try { await handleAdminUserDetail(bot, chatId, text); } catch (e) { logger.error(e); }
@@ -278,14 +363,17 @@ export function initBot(): TelegramBot {
 
   // ─── BACKGROUND TASKS ────────────────────────────────────────────────────────
 
+  // Expire old PvP bets every minute
   setInterval(async () => {
     try { await expireOldBets(); } catch { /* ignore */ }
   }, 60 * 1000);
 
+  // Unlock Stars deposits every hour
   setInterval(async () => {
     try { await processLockedStars(); } catch { /* ignore */ }
   }, 60 * 60 * 1000);
 
+  // Expire newbie bonuses daily
   setInterval(async () => {
     try {
       const expired = await query(
@@ -295,7 +383,10 @@ export function initBot(): TelegramBot {
       );
       for (const user of expired.rows) {
         const bonus = parseFloat(user.bonus_balance);
-        await query("UPDATE bot_users SET bonus_balance=0, newbie_bonus_expires_at=NULL, updated_at=NOW() WHERE id=$1", [user.id]);
+        await query(
+          "UPDATE bot_users SET bonus_balance=0, newbie_bonus_expires_at=NULL, updated_at=NOW() WHERE id=$1",
+          [user.id]
+        );
         await query(
           `INSERT INTO house_stats (date, recovered_bonus) VALUES (CURRENT_DATE, $1)
            ON CONFLICT (date) DO UPDATE SET recovered_bonus = house_stats.recovered_bonus + $1`,
@@ -319,7 +410,7 @@ export function initBot(): TelegramBot {
     if (data === "mode_pvp") { await handleModeSelect(bot, chatId, userId, "pvp"); return; }
     if (data === "mode_bot") { await handleModeSelect(bot, chatId, userId, "bot"); return; }
 
-    // Game select: game_pvp_dice, game_bot_slots
+    // Game select: game_pvp_dice | game_bot_slots
     const gameMatch = data.match(/^game_(pvp|bot)_(.+)$/);
     if (gameMatch) {
       const [, mode, gameType] = gameMatch;
@@ -336,21 +427,28 @@ export function initBot(): TelegramBot {
       return;
     }
 
-    // Stars invoice buttons: stars_invoice_20
+    // Stars preset invoice: stars_invoice_20
     const starsInvoiceMatch = data.match(/^stars_invoice_(\d+)$/);
     if (starsInvoiceMatch) {
       await sendStarsInvoice(bot, chatId, userId, parseInt(starsInvoiceMatch[1]));
       return;
     }
 
-    // Accept bet
+    // Stars custom amount prompt
+    if (data === "stars_custom_amount") {
+      pendingStarsCustom.add(userId);
+      await handleStarsCustomAmount(bot, chatId);
+      return;
+    }
+
+    // Accept PvP bet
     if (data.startsWith("accept_bet_")) {
       const betId = parseInt(data.replace("accept_bet_", ""));
       await handleAcceptBet(bot, chatId, userId, betId);
       return;
     }
 
-    // Cancel bet
+    // Cancel PvP bet
     if (data.startsWith("cancel_bet_")) {
       const betId = parseInt(data.replace("cancel_bet_", ""));
       const betRes = await query("SELECT * FROM game_bets WHERE id=$1 AND status='waiting'", [betId]);
@@ -361,7 +459,7 @@ export function initBot(): TelegramBot {
       return;
     }
 
-    // RPS choice
+    // RPS choice: rps_creator_42_rock
     const rpsMatch = data.match(/^rps_(creator|opponent)_(\d+)_(rock|paper|scissors)$/);
     if (rpsMatch) {
       const [, role, betIdStr, choice] = rpsMatch;
@@ -369,15 +467,15 @@ export function initBot(): TelegramBot {
       return;
     }
 
-    // Wallet
-    if (data === "wallet_deposit") { await handleDeposit(bot, chatId, userId); return; }
-    if (data === "wallet_withdraw") { await handleWithdraw(bot, chatId, userId); return; }
+    // Wallet actions
+    if (data === "wallet_deposit")      { await handleDeposit(bot, chatId, userId); return; }
+    if (data === "wallet_withdraw")     { await handleWithdraw(bot, chatId, userId); return; }
     if (data === "wallet_transactions") { await handleTransactionHistory(bot, chatId, userId); return; }
-    if (data === "wallet_pending_stars") { await handlePendingStars(bot, chatId, userId); return; }
-    if (data === "deposit_usdt") { await handleDepositUSDT(bot, chatId, userId); return; }
-    if (data === "deposit_stars") { await handleDepositStars(bot, chatId, userId); return; }
-    if (data === "deposit_ton") { await handleDepositTON(bot, chatId, userId); return; }
-    if (data === "withdraw_usdt") { await handleWithdrawUSDT(bot, chatId, userId); return; }
+    if (data === "wallet_pending_stars"){ await handlePendingStars(bot, chatId, userId); return; }
+    if (data === "deposit_usdt")        { await handleDepositUSDT(bot, chatId, userId); return; }
+    if (data === "deposit_stars")       { await handleDepositStars(bot, chatId, userId); return; }
+    if (data === "deposit_ton")         { await handleDepositTON(bot, chatId, userId); return; }
+    if (data === "withdraw_usdt")       { await handleWithdrawUSDT(bot, chatId, userId); return; }
 
     if (data === "withdraw_history") {
       const { getWithdrawHistory } = await import("./services/withdrawService");
@@ -392,20 +490,20 @@ export function initBot(): TelegramBot {
       return;
     }
 
-    // Tasks
+    // Tasks: claim reward
     if (data.startsWith("claim_task_")) {
       const taskId = parseInt(data.replace("claim_task_", ""));
       await handleClaimTask(bot, callbackQueryId, chatId, userId, taskId);
       return;
     }
 
-    // Admin callbacks
+    // ── Admin callbacks ──────────────────────────────────────────────────────────
     if (isAdmin(userId)) {
-      if (data === "admin_profit") { await handleAdminProfit(bot, chatId); return; }
-      if (data === "admin_pending_withdrawals") { await handleAdminPendingWithdrawals(bot, chatId); return; }
-      if (data === "admin_risk_settings") { await handleAdminRiskSettings(bot, chatId); return; }
-      if (data === "admin_recent_games") { await handleAdminRecentGames(bot, chatId); return; }
-      if (data === "admin_top_winners") { await handleAdminTopWinners(bot, chatId); return; }
+      if (data === "admin_profit")               { await handleAdminProfit(bot, chatId); return; }
+      if (data === "admin_pending_withdrawals")  { await handleAdminPendingWithdrawals(bot, chatId); return; }
+      if (data === "admin_risk_settings")        { await handleAdminRiskSettings(bot, chatId); return; }
+      if (data === "admin_recent_games")         { await handleAdminRecentGames(bot, chatId); return; }
+      if (data === "admin_top_winners")          { await handleAdminTopWinners(bot, chatId); return; }
 
       if (data === "admin_user_lookup") {
         pendingAdminLookup.add(userId);
@@ -478,24 +576,22 @@ export function initBot(): TelegramBot {
       );
 
       const payout = parseFloat(String(completedBet.payout));
-      let resultMsg = winner === "draw"
+      const resultMsg = winner === "draw"
         ? `🤝 ${b("DRAW!")} Both players refunded.`
-        : `🏆 ${b("Player #" + winnerId + " WINS ")} ${formatUSD(payout)}!`;
+        : `🏆 ${b("Player #" + winnerId + " WINS")} ${formatUSD(payout)}!`;
 
       await bot.sendMessage(targetChat, resultMsg, { parse_mode: "HTML" });
 
-      // Notify both players in private if game was in a group
+      // Notify players in private if game was in a group
       if (gameBet.group_chat_id) {
-        const loserMsg = winner === "draw"
-          ? `🤝 Draw! Your bet was refunded.`
-          : winnerId !== gameBet.creator_id
-            ? `💀 You lost the ${gameBet.game_type} bet. Better luck next time!`
-            : `🏆 You won ${formatUSD(payout)}!`;
-        try { await bot.sendMessage(gameBet.creator_id, loserMsg); } catch { /* ignore */ }
-        if (winner !== "draw") {
-          const opponentMsg = winnerId === userId ? `🏆 You won ${formatUSD(payout)}!` : `💀 You lost! Better luck next time.`;
-          try { await bot.sendMessage(userId, opponentMsg); } catch { /* ignore */ }
-        }
+        try {
+          const creatorMsg = winner === "draw" ? "🤝 Draw! Refunded." :
+            winnerId === gameBet.creator_id ? `🏆 You won ${formatUSD(payout)}!` : "💀 You lost! Better luck next time.";
+          await bot.sendMessage(gameBet.creator_id, creatorMsg);
+          const opponentMsg = winner === "draw" ? "🤝 Draw! Refunded." :
+            winnerId === userId ? `🏆 You won ${formatUSD(payout)}!` : "💀 You lost! Better luck next time.";
+          await bot.sendMessage(userId, opponentMsg);
+        } catch { /* ignore */ }
       }
     } catch (e) {
       logger.error(e, "Error completing PvP bet");

@@ -4,7 +4,8 @@ import { formatUSD, formatDate, b, i, code } from "../utils";
 import { depositKeyboard } from "./keyboard";
 
 const TON_WALLET = process.env.TON_WALLET || "UQDqFSJ_gNtlwbRPmoJmEbJ4yxomqJNSJzDWdI6Dg-pQRNzL";
-const MIN_STARS = 20;
+export const MIN_STARS = 5;
+export const MIN_DEPOSIT_USD = 0.05;
 
 export async function handleDeposit(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const text = `📥 ${b("Deposit Funds")}\n\n`
@@ -12,7 +13,7 @@ export async function handleDeposit(bot: TelegramBot, chatId: number, userId: nu
     + `💵 ${b("USDT")} — Automatic, instant credit\n`
     + `⭐ ${b("Stars")} — 1 ⭐ = $0.01, 21-day lock\n`
     + `⚡ ${b("TON")} — Manual, requires comment\n\n`
-    + `${i("Min deposit: $1 USDT")}`;
+    + `${i("Min deposit: $" + MIN_DEPOSIT_USD + " USDT | " + MIN_STARS + " Stars")}`;
 
   await bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
@@ -22,18 +23,18 @@ export async function handleDeposit(bot: TelegramBot, chatId: number, userId: nu
 
 export async function handleDepositUSDT(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   await bot.sendMessage(chatId,
-    `💵 ${b("USDT Deposit")}\n\nEnter the amount in USD you want to deposit:\n${i("Example: 5, 10, 50")}`,
+    `💵 ${b("USDT Deposit")}\n\nEnter the amount in USD you want to deposit:\n${i("Min: $" + MIN_DEPOSIT_USD + " — Example: 0.05, 1, 10, 50")}`,
     {
       parse_mode: "HTML",
-      reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD" },
+      reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD (min $0.05)" },
     }
   );
 }
 
 export async function processUSDTDepositAmount(bot: TelegramBot, chatId: number, userId: number, amountStr: string): Promise<void> {
   const amount = parseFloat(amountStr);
-  if (isNaN(amount) || amount < 1) {
-    await bot.sendMessage(chatId, "❌ Minimum deposit is $1.00 USDT. Please enter a valid amount.");
+  if (isNaN(amount) || amount < MIN_DEPOSIT_USD) {
+    await bot.sendMessage(chatId, `❌ Minimum deposit is $${MIN_DEPOSIT_USD}. Please enter a valid amount.`);
     return;
   }
   if (amount > 10000) {
@@ -89,28 +90,41 @@ export async function handleDepositTON(bot: TelegramBot, chatId: number, userId:
 export async function handleDepositStars(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const text = `⭐ ${b("Telegram Stars Deposit")}\n\n`
     + `• 1 ⭐ = $0.01 USD\n`
-    + `• Minimum: ${MIN_STARS} Stars ($${MIN_STARS * 0.01})\n`
+    + `• Minimum: ${MIN_STARS} Stars ($${(MIN_STARS * 0.01).toFixed(2)})\n`
     + `• 🔒 21-Day Lock — credited after 21 days\n`
     + `• Anti-scam protection enabled\n\n`
-    + `Choose how many Stars to deposit:`;
+    + `Choose a preset or enter a custom amount:`;
 
   await bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "⭐ 20 Stars", callback_data: `stars_invoice_20` },
-          { text: "⭐ 50 Stars", callback_data: `stars_invoice_50` },
-          { text: "⭐ 100 Stars", callback_data: `stars_invoice_100` },
+          { text: `⭐ ${MIN_STARS}`, callback_data: `stars_invoice_${MIN_STARS}` },
+          { text: "⭐ 20", callback_data: "stars_invoice_20" },
+          { text: "⭐ 50", callback_data: "stars_invoice_50" },
         ],
         [
-          { text: "⭐ 250 Stars", callback_data: `stars_invoice_250` },
-          { text: "⭐ 500 Stars", callback_data: `stars_invoice_500` },
+          { text: "⭐ 100", callback_data: "stars_invoice_100" },
+          { text: "⭐ 250", callback_data: "stars_invoice_250" },
+          { text: "⭐ 500", callback_data: "stars_invoice_500" },
         ],
+        [{ text: "✏️ Custom Amount", callback_data: "stars_custom_amount" }],
         [{ text: "« Back", callback_data: "wallet_deposit" }],
       ],
     },
   });
+}
+
+// Prompt user to type a custom Stars amount
+export async function handleStarsCustomAmount(bot: TelegramBot, chatId: number): Promise<void> {
+  await bot.sendMessage(chatId,
+    `⭐ ${b("Custom Stars Amount")}\n\nEnter the number of Stars to deposit:\n${i("Min: " + MIN_STARS + " Stars")}`,
+    {
+      parse_mode: "HTML",
+      reply_markup: { force_reply: true, input_field_placeholder: `Min ${MIN_STARS} Stars` },
+    }
+  );
 }
 
 // Send a real Telegram Stars (XTR) invoice
@@ -131,7 +145,7 @@ export async function sendStarsInvoice(bot: TelegramBot, chatId: number, userId:
         `Value: $${usdValue.toFixed(2)} USD\n` +
         `⚠️ 21-day lock applies before funds are credited.`,
       payload,
-      "", // provider_token — empty string for XTR (Stars)
+      "",    // provider_token — empty for XTR (Stars)
       "XTR", // currency = Telegram Stars
       [{ label: `${starsCount} Stars Deposit`, amount: starsCount }]
     );
@@ -140,7 +154,7 @@ export async function sendStarsInvoice(bot: TelegramBot, chatId: number, userId:
   }
 }
 
-// Called after successful Stars payment
+// Called after successful Stars payment confirmation from Telegram
 export async function handleSuccessfulStarsPayment(
   bot: TelegramBot,
   chatId: number,
@@ -148,7 +162,7 @@ export async function handleSuccessfulStarsPayment(
   payload: string,
   telegramPaymentChargeId: string
 ): Promise<void> {
-  // Parse payload: stars_userId_starsCount_timestamp
+  // payload format: stars_userId_starsCount_timestamp
   const parts = payload.split("_");
   if (parts.length < 3 || parts[0] !== "stars") return;
 
