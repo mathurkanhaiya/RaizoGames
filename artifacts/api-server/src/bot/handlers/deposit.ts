@@ -5,7 +5,7 @@ import { depositKeyboard } from "./keyboard";
 
 const TON_WALLET = process.env.TON_WALLET || "UQDqFSJ_gNtlwbRPmoJmEbJ4yxomqJNSJzDWdI6Dg-pQRNzL";
 export const MIN_STARS = 5;
-export const MIN_DEPOSIT_USD = 1.00; // OxaPay minimum is $1.00 USDT
+export const MIN_DEPOSIT_USD = 0.10;
 
 export async function handleDeposit(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   const text = `📥 ${b("Deposit Funds")}\n\n`
@@ -13,7 +13,7 @@ export async function handleDeposit(bot: TelegramBot, chatId: number, userId: nu
     + `💵 ${b("USDT")} — Automatic, instant credit\n`
     + `⭐ ${b("Stars")} — 1 ⭐ = $0.01, 21-day lock\n`
     + `⚡ ${b("TON")} — Manual, requires comment\n\n`
-    + `${i("Min deposit: $" + MIN_DEPOSIT_USD + " USDT | " + MIN_STARS + " Stars")}`;
+    + `${i("Min deposit: $" + MIN_DEPOSIT_USD.toFixed(2) + " USDT | " + MIN_STARS + " Stars")}`;
 
   await bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
@@ -23,10 +23,10 @@ export async function handleDeposit(bot: TelegramBot, chatId: number, userId: nu
 
 export async function handleDepositUSDT(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   await bot.sendMessage(chatId,
-    `💵 ${b("USDT Deposit")}\n\nEnter the amount in USD you want to deposit:\n${i("Min: $" + MIN_DEPOSIT_USD + " — Example: 1, 5, 10, 50")}`,
+    `💵 ${b("USDT Deposit")}\n\nEnter the amount in USD you want to deposit:\n${i("Min: $" + MIN_DEPOSIT_USD.toFixed(2) + " — Example: 0.1, 1, 5, 10, 50")}`,
     {
       parse_mode: "HTML",
-      reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD (min $1.00)" },
+      reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD (min $0.10)" },
     }
   );
 }
@@ -47,24 +47,26 @@ export async function processUSDTDepositAmount(bot: TelegramBot, chatId: number,
   const invoice = await createOxaPayInvoice(userId, amount);
   if (!invoice) {
     await bot.sendMessage(chatId,
-      `❌ ${b("Failed to create invoice")}\n\nPossible reasons:\n• Amount below OxaPay minimum ($1.00)\n• Payment gateway temporarily unavailable\n\nPlease try again or contact support.`,
+      `❌ ${b("Failed to create invoice")}\n\nThe payment gateway rejected this amount (minimum may be higher).\n\nTry a higher amount or contact @RaizoGamesSupport for help.`,
       { parse_mode: "HTML" }
     );
     return;
   }
 
-  const text = `💵 ${b("USDT Deposit — " + formatUSD(amount))}\n\n`
-    + `Click the button below to pay:\n`
-    + `Order ID: ${code(invoice.orderId)}\n\n`
-    + `✅ Your balance will be credited automatically after confirmation.\n`
-    + `⏱ Payment link expires in 30 minutes.`;
+  const text =
+    `✅ ${b("Payment Created!")}\n\n`
+    + `🆔 ${b("Payment ID:")} ${code(invoice.orderId)}\n`
+    + `💰 ${b("Amount:")} $${amount.toFixed(2)} USD\n`
+    + `🔗 ${b("Payment Link:")} <a href="${invoice.payUrl}">Pay Now</a>\n\n`
+    + `📩 ${i("Note: If you've sent the payment and it's not reflected or you face any issues, contact @RaizoGamesSupport for support.")}`;
 
   await bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
+    disable_web_page_preview: true,
     reply_markup: {
       inline_keyboard: [
         [{ text: "💳 Pay Now", url: invoice.payUrl }],
-        [{ text: "« Back to Wallet", callback_data: "back_wallet" }],
+        [{ text: "❌ Cancel Deposit", callback_data: "back_wallet" }],
       ],
     },
   });
