@@ -236,30 +236,83 @@ export function initBot(): TelegramBot {
   });
 
   // Refund Stars by Telegram charge ID — admin only
+  // This calls Telegram's actual refundStarPayment API to return Stars to the user
   bot.onText(/\/refund (.+)/, async (msg, match) => {
     if (!isAdmin(msg.from!.id)) return;
     const chargeId = match![1].trim();
+    const adminChatId = msg.chat.id;
+
     try {
       const result = await refundStarsByChargeId(chargeId);
+
       if (result.alreadyRefunded) {
-        await bot.sendMessage(msg.chat.id, `⚠️ Charge ID already refunded previously.`);
-      } else if (!result.success) {
-        await bot.sendMessage(msg.chat.id, `❌ Charge ID not found: ${code(chargeId)}\n\nMake sure it's the Telegram charge ID from the Stars payment.`, { parse_mode: "HTML" });
-      } else {
-        await bot.sendMessage(msg.chat.id,
-          `✅ ${b("Stars Refund Processed")}\n\nCharge ID: ${code(chargeId)}\nUser: #${result.userId}\nStars: ${result.starsCount} ⭐\n\n${i("Deposit marked as refunded. Balance adjusted if already credited.")}`,
+        await bot.sendMessage(adminChatId,
+          `⚠️ ${b("Already Refunded")}\n\nCharge ID ${code(chargeId)} was already refunded previously.`,
           { parse_mode: "HTML" }
         );
-        // Notify the user
+        return;
+      }
+
+      if (!result.success || !result.userId) {
+        await bot.sendMessage(adminChatId,
+          `❌ ${b("Charge ID Not Found")}\n\n${code(chargeId)}\n\nMake sure you're using the exact Telegram payment charge ID (starts with something like ${code("5678...")}).`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+
+      // ── Actually send Stars back via Telegram API ────────────────────────
+      let telegramRefundOk = false;
+      let telegramError = "";
+      try {
+        const apiUrl = `https://api.telegram.org/bot${BOT_TOKEN}/refundStarPayment`;
+        const axios = (await import("axios")).default;
+        const tgRes = await axios.post(apiUrl, {
+          user_id: result.userId,
+          telegram_payment_charge_id: chargeId,
+        }, { timeout: 15000 });
+
+        telegramRefundOk = tgRes.data?.ok === true;
+        if (!telegramRefundOk) {
+          telegramError = tgRes.data?.description || "Unknown Telegram error";
+        }
+      } catch (err: unknown) {
+        const axiosErr = err as { response?: { data?: { description?: string } }; message?: string };
+        telegramError = axiosErr?.response?.data?.description || axiosErr?.message || "Network error";
+      }
+
+      if (telegramRefundOk) {
+        // Success — Stars are back in the user's account
+        await bot.sendMessage(adminChatId,
+          `✅ ${b("Stars Refunded Successfully!")}\n\n`
+          + `👤 User: #${result.userId}\n`
+          + `⭐ Stars: ${result.starsCount}\n`
+          + `🔖 Charge ID: ${code(chargeId)}\n\n`
+          + `${i("Stars returned to user's Telegram account. Bot balance adjusted.")}`,
+          { parse_mode: "HTML" }
+        );
+        // Notify user that Stars arrived back
         try {
-          await bot.sendMessage(result.userId!,
-            `↩️ ${b("Stars Refund Received")}\n\n${result.starsCount} ⭐ have been refunded.\nCharge ID: ${code(chargeId)}`,
+          await bot.sendMessage(result.userId,
+            `⭐ ${b("Stars Refund Received!")}\n\n`
+            + `${result.starsCount} ⭐ Stars have been returned to your Telegram account.\n\n`
+            + `${i("Your RAIZO GAMES balance has been adjusted accordingly.")}`,
             { parse_mode: "HTML" }
           );
         } catch { /* user may have blocked bot */ }
+      } else {
+        // Telegram rejected the refund (charge too old, already refunded on TG side, etc.)
+        await bot.sendMessage(adminChatId,
+          `⚠️ ${b("DB Updated — But Telegram Rejected Refund")}\n\n`
+          + `Charge ID: ${code(chargeId)}\n`
+          + `User: #${result.userId} | Stars: ${result.starsCount}\n\n`
+          + `❌ Telegram API error: ${escapeHtml(telegramError)}\n\n`
+          + `${i("The deposit was marked as refunded in our database.\nTelegram may have already refunded this, or the charge ID is invalid/expired (21-day window).")}`,
+          { parse_mode: "HTML" }
+        );
       }
     } catch (e) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${escapeHtml((e as Error).message)}`);
+      await bot.sendMessage(adminChatId, `❌ Error: ${escapeHtml((e as Error).message)}`);
     }
   });
 
