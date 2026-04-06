@@ -4,7 +4,10 @@ import { recordDeposit } from "./riskService";
 import axios from "axios";
 
 const OXAPAY_API = "https://api.oxapay.com";
-const OXAPAY_KEY = process.env.OXAPAY_API_KEY || "";
+// OxaPay has TWO separate keys:
+//   OXAPAY_API_KEY      = General API key (swaps, rates)
+//   OXAPAY_MERCHANT_KEY = Merchant API key (payment invoices) ← required for deposits
+const OXAPAY_MERCHANT_KEY = process.env.OXAPAY_MERCHANT_KEY || process.env.OXAPAY_API_KEY || "";
 const BOT_USERNAME = process.env.BOT_USERNAME || "RaizoPvPBot";
 
 export interface DepositRecord {
@@ -26,8 +29,8 @@ export async function createOxaPayInvoice(
   userId: number,
   amountUSD: number
 ): Promise<{ payUrl: string; orderId: string } | null> {
-  if (!OXAPAY_KEY) {
-    console.error("OXAPAY_API_KEY is not set");
+  if (!OXAPAY_MERCHANT_KEY) {
+    console.error("OXAPAY_MERCHANT_KEY is not set");
     return null;
   }
 
@@ -37,12 +40,14 @@ export async function createOxaPayInvoice(
     : "";
 
   try {
+    // OxaPay Merchant API: key goes in the body as "merchant"
     const response = await axios.post(
-      `${OXAPAY_API}/v1/payment`,
+      `${OXAPAY_API}/merchants/request`,
       {
+        merchant: OXAPAY_MERCHANT_KEY,
         amount: amountUSD,
         currency: "USDT",
-        lifeTime: 30,         // 30 minutes
+        lifeTime: 30,
         feePaidByPayer: 0,
         underPaidCover: 5,
         callbackUrl: webhookUrl,
@@ -50,34 +55,23 @@ export async function createOxaPayInvoice(
         description: `RAIZO GAMES Deposit — User ${userId}`,
         orderId,
       },
-      {
-        timeout: 15000,
-        headers: {
-          merchant_api_key: OXAPAY_KEY,
-          "Content-Type": "application/json",
-        },
-      }
+      { timeout: 15000 }
     );
 
     const data = response.data;
-
-    // OxaPay v1 returns: { result: "success", data: { trackId, payLink } }
-    // Older format returns: { result: 100, trackId, payLink }
-    const isSuccess = data?.result === "success" || data?.result === 100;
-    const payLink: string | undefined = data?.data?.payLink || data?.payLink;
-    const trackId: string = data?.data?.trackId || data?.trackId || orderId;
-
-    if (isSuccess && payLink) {
+    // OxaPay result 100 = success
+    if (data?.result === 100 && data?.payLink) {
+      const trackId: string = data.trackId || orderId;
       await query(
         `INSERT INTO deposits (user_id, method, amount, usd_amount, status, oxapay_order_id)
          VALUES ($1, 'usdt', $2, $2, 'pending', $3)`,
         [userId, amountUSD, trackId]
       );
-      return { payUrl: payLink, orderId: trackId };
+      return { payUrl: data.payLink, orderId: trackId };
     }
 
-    // Log full response so we can debug from server logs
-    console.error("OxaPay non-success response:", JSON.stringify(data));
+    // Log full response including result code and message so we can debug
+    console.error(`OxaPay error — result: ${data?.result}, message: ${data?.message}`);
     return null;
   } catch (err: unknown) {
     if (err && typeof err === "object" && "response" in err) {
