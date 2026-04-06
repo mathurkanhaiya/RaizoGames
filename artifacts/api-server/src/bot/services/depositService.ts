@@ -38,9 +38,8 @@ export async function createOxaPayInvoice(
 
   try {
     const response = await axios.post(
-      `${OXAPAY_API}/merchants/request`,
+      `${OXAPAY_API}/v1/payment`,
       {
-        merchant: OXAPAY_KEY,
         amount: amountUSD,
         currency: "USDT",
         lifeTime: 30,         // 30 minutes
@@ -51,27 +50,42 @@ export async function createOxaPayInvoice(
         description: `RAIZO GAMES Deposit — User ${userId}`,
         orderId,
       },
-      { timeout: 15000 }
+      {
+        timeout: 15000,
+        headers: {
+          merchant_api_key: OXAPAY_KEY,
+          "Content-Type": "application/json",
+        },
+      }
     );
 
     const data = response.data;
-    // OxaPay success: result code 100
-    if (data?.result === 100 && data?.payLink) {
-      const trackId = data.trackId || orderId;
+
+    // OxaPay v1 returns: { result: "success", data: { trackId, payLink } }
+    // Older format returns: { result: 100, trackId, payLink }
+    const isSuccess = data?.result === "success" || data?.result === 100;
+    const payLink: string | undefined = data?.data?.payLink || data?.payLink;
+    const trackId: string = data?.data?.trackId || data?.trackId || orderId;
+
+    if (isSuccess && payLink) {
       await query(
         `INSERT INTO deposits (user_id, method, amount, usd_amount, status, oxapay_order_id)
          VALUES ($1, 'usdt', $2, $2, 'pending', $3)`,
         [userId, amountUSD, trackId]
       );
-      return { payUrl: data.payLink, orderId: trackId };
+      return { payUrl: payLink, orderId: trackId };
     }
 
-    // Non-100 means OxaPay returned an error
+    // Log full response so we can debug from server logs
     console.error("OxaPay non-success response:", JSON.stringify(data));
     return null;
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("OxaPay request failed:", msg);
+    if (err && typeof err === "object" && "response" in err) {
+      const axErr = err as { response?: { status?: number; data?: unknown }; message?: string };
+      console.error("OxaPay API error:", axErr.response?.status, JSON.stringify(axErr.response?.data));
+    } else {
+      console.error("OxaPay request failed:", err instanceof Error ? err.message : String(err));
+    }
     return null;
   }
 }
