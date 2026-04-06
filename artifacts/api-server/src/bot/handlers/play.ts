@@ -1,12 +1,14 @@
 import TelegramBot from "node-telegram-bot-api";
 import { getUserBalance, getUser } from "../services/userService";
 import { createBet, completeBet, getWaitingBets } from "../services/gameService";
-import { getHouseEdge, isBotPaused, shouldBotLose, getForcePvPAbove } from "../services/riskService";
+import { isBotPaused, shouldBotLose, getForcePvPAbove } from "../services/riskService";
 import { generateBotDiceValue, getRPSBotChoice, formatDiceResult, telegramDiceEmoji, resolveGameByValues } from "../games/engine";
 import { formatUSD, getGameEmoji, getRPSEmoji, parseBetAmount, sleep, b, i, escapeHtml } from "../utils";
 import { betAmountKeyboard, modeSelectKeyboard, gameSelectKeyboard, rpsKeyboard } from "./keyboard";
 
-// In-memory state for user flows (in production, use Redis)
+const BOT_USERNAME = process.env.BOT_USERNAME || "RaizoPvPBot";
+
+// In-memory state for user flows
 export const userState: Map<number, {
   step: string;
   gameType?: string;
@@ -18,9 +20,9 @@ export const userState: Map<number, {
 export async function handlePlay(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   await bot.sendMessage(chatId,
     `🎮 ${b("Choose Game Mode")}\n\n`
-    + `⚔️ ${b("PvP")} — Challenge other players in groups\n`
-    + `🤖 ${b("vs Bot")} — Instant play (private chat)\n\n`
-    + `${i("Bets above $10 are PvP only")}`,
+    + `⚔️ ${b("PvP")} — Challenge a real opponent (any chat)\n`
+    + `🤖 ${b("vs Bot")} — Instant play against the house\n\n`
+    + `${i("Bets above $10 require PvP mode")}`,
     {
       parse_mode: "HTML",
       reply_markup: modeSelectKeyboard(),
@@ -89,7 +91,7 @@ export async function processBet(bot: TelegramBot, chatId: number, userId: numbe
 
   const forcePvPAbove = await getForcePvPAbove();
   if (amount > forcePvPAbove && mode === "bot") {
-    await bot.sendMessage(chatId, `🔒 Bets above ${formatUSD(forcePvPAbove)} must be PvP only.\nUse the group chat to challenge other players.`);
+    await bot.sendMessage(chatId, `🔒 Bets above ${formatUSD(forcePvPAbove)} must be PvP.\nUse /play and select PvP mode.`);
     return;
   }
 
@@ -107,7 +109,9 @@ export async function processBet(bot: TelegramBot, chatId: number, userId: numbe
   if (mode === "bot") {
     await playVsBot(bot, chatId, userId, gameType, amount);
   } else {
-    await createPvPBet(bot, chatId, userId, gameType, amount);
+    // Detect if this is a group chat or private chat
+    const isGroup = chatId < 0;
+    await createPvPBet(bot, chatId, userId, gameType, amount, isGroup);
   }
 }
 
@@ -141,8 +145,6 @@ async function playVsBot(bot: TelegramBot, chatId: number, userId: number, gameT
 
     await sleep(3500);
 
-    const botValue = generateBotDiceValue(gameType, botShouldLose, playerValue);
-
     await bot.sendMessage(chatId, `🤖 ${b("Bot rolls...")}`, { parse_mode: "HTML" });
     const botDiceMsg = await bot.sendDice(chatId, { emoji: diceEmoji });
 
@@ -163,7 +165,6 @@ async function playVsBot(bot: TelegramBot, chatId: number, userId: number, gameT
 
     const houseFee = parseFloat(String(completedBet.house_fee));
     const payout = parseFloat(String(completedBet.payout));
-    // Net profit for user = payout received - original bet deducted
     const netProfit = winner === "creator" ? payout - amount : 0;
 
     let resultText = `\n━━━━━━━━━━━━━━\n`;
@@ -202,27 +203,53 @@ async function playVsBot(bot: TelegramBot, chatId: number, userId: number, gameT
   }
 }
 
-async function createPvPBet(bot: TelegramBot, chatId: number, userId: number, gameType: string, amount: number): Promise<void> {
+async function createPvPBet(bot: TelegramBot, chatId: number, userId: number, gameType: string, amount: number, isGroup: boolean): Promise<void> {
   try {
-    const bet = await createBet(userId, gameType, "pvp", amount, chatId);
+    // Only store groupChatId if this is an actual group — not a private chat
+    const groupChatId = isGroup ? chatId : undefined;
+    const bet = await createBet(userId, gameType, "pvp", amount, groupChatId);
 
-    await bot.sendMessage(chatId,
-      `⚔️ ${b("PvP Bet Created!")}\n\n`
-      + `${getGameEmoji(gameType)} Game: ${gameType.charAt(0).toUpperCase() + gameType.slice(1)}\n`
+    const winnerAmount = formatUSD(amount * 2 * 0.93);
+    const gameLabel = gameType.charAt(0).toUpperCase() + gameType.slice(1);
+
+    // Deep link anyone can tap to accept (works in private and group)
+    const acceptLink = `https://t.me/${BOT_USERNAME}?start=accept_${bet.id}`;
+
+    let msg = `⚔️ ${b("PvP Bet Created!")}\n\n`
+      + `${getGameEmoji(gameType)} Game: ${gameLabel}\n`
       + `💰 Bet: ${formatUSD(amount)} each\n`
-      + `🏆 Winner gets: ~${formatUSD(amount * 2 * 0.93)}\n`
-      + `⏱ Expires in 5 minutes\n\n`
-      + `${b("Bet ID: #" + bet.id)}\n\n`
-      + `Share this in a group chat for others to accept!`,
-      {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "❌ Cancel Bet", callback_data: `cancel_bet_${bet.id}` }],
-          ],
-        },
-      }
-    );
+      + `🏆 Winner gets: ~${winnerAmount}\n`
+      + `⏱ Expires in 5 minutes\n`
+      + `${b("Bet ID: #" + bet.id)}\n\n`;
+
+    if (isGroup) {
+      msg += `${i("Tap the button below to accept!")}`;
+    } else {
+      msg += `${i("Share the link below so someone can challenge you!")}`;
+    }
+
+    const keyboard: TelegramBot.InlineKeyboardButton[][] = [];
+
+    if (isGroup) {
+      // In group: show accept button right there
+      keyboard.push([{ text: `⚔️ Accept Bet — ${formatUSD(amount)}`, callback_data: `accept_bet_${bet.id}` }]);
+    } else {
+      // In private: show share link + accept link others can open
+      keyboard.push([{
+        text: "📤 Share to get opponent",
+        url: `https://t.me/share/url?url=${encodeURIComponent(acceptLink)}&text=${encodeURIComponent(
+          `⚔️ I challenged you to ${gameLabel} on RAIZO GAMES!\nBet: ${formatUSD(amount)} each — Winner gets ~${winnerAmount}\nTap to accept: `
+        )}`,
+      }]);
+      keyboard.push([{ text: "👥 Find Open Bets", callback_data: "find_pvp_bets" }]);
+    }
+
+    keyboard.push([{ text: "❌ Cancel Bet", callback_data: `cancel_bet_${bet.id}` }]);
+
+    await bot.sendMessage(chatId, msg, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard },
+    });
 
     userState.delete(userId);
   } catch (err: unknown) {
@@ -295,22 +322,26 @@ export async function handleRPSChoice(bot: TelegramBot, chatId: number, userId: 
 }
 
 export async function handleQuickJoin(bot: TelegramBot, chatId: number, userId: number, gameType?: string): Promise<void> {
-  const bets = await getWaitingBets(gameType, chatId);
+  const bets = await getWaitingBets(gameType);
   const available = bets.filter((bet) => bet.creator_id !== userId);
 
   if (available.length === 0) {
-    await bot.sendMessage(chatId, `🔍 No open bets found${gameType ? ` for ${gameType}` : ""}. Create one with /play!`);
+    await bot.sendMessage(chatId, `🔍 No open bets right now${gameType ? ` for ${gameType}` : ""}.\n\nCreate one with /play!`);
     return;
   }
 
-  let text = `⚡ ${b("Open Bets")}\n\n`;
+  let text = `⚡ ${b("Open PvP Bets")}\n\n`;
   for (const bet of available.slice(0, 5)) {
-    const displayName = escapeHtml((bet as { username?: string }).username ? `@${(bet as { username?: string }).username}` : `user#${bet.creator_id}`);
+    const displayName = escapeHtml(
+      (bet as { username?: string }).username
+        ? `@${(bet as { username?: string }).username}`
+        : `Player#${bet.creator_id}`
+    );
     text += `• #${bet.id} ${getGameEmoji(bet.game_type)} ${bet.game_type} — ${formatUSD(parseFloat(String(bet.bet_amount)))} by ${displayName}\n`;
   }
 
   const keyboard = available.slice(0, 5).map((bet) => ([{
-    text: `${getGameEmoji(bet.game_type)} #${bet.id} — ${formatUSD(parseFloat(String(bet.bet_amount)))}`,
+    text: `${getGameEmoji(bet.game_type)} #${bet.id} — ${formatUSD(parseFloat(String(bet.bet_amount)))} — Accept`,
     callback_data: `accept_bet_${bet.id}`,
   }]));
 
@@ -318,4 +349,46 @@ export async function handleQuickJoin(bot: TelegramBot, chatId: number, userId: 
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: keyboard },
   });
+}
+
+// Accept a PvP bet by ID — used from deep link `/start accept_<betId>`
+export async function handleAcceptFromDeepLink(bot: TelegramBot, chatId: number, userId: number, betId: number): Promise<void> {
+  const { query } = await import("../db");
+  const betRes = await query(
+    "SELECT gb.*, u.username, u.first_name FROM game_bets gb JOIN bot_users u ON gb.creator_id=u.id WHERE gb.id=$1 AND gb.status='waiting'",
+    [betId]
+  );
+  const bet = betRes.rows[0];
+
+  if (!bet) {
+    await bot.sendMessage(chatId, "❌ Bet not found or already accepted.");
+    return;
+  }
+  if (bet.creator_id === userId) {
+    await bot.sendMessage(chatId, "❌ You can't accept your own bet!");
+    return;
+  }
+
+  const creatorName = escapeHtml(bet.username ? `@${bet.username}` : bet.first_name || `Player#${bet.creator_id}`);
+  const gameLabel = bet.game_type.charAt(0).toUpperCase() + bet.game_type.slice(1);
+
+  await bot.sendMessage(chatId,
+    `⚔️ ${b("PvP Challenge!")}\n\n`
+    + `From: ${creatorName}\n`
+    + `Game: ${getGameEmoji(bet.game_type)} ${gameLabel}\n`
+    + `Bet: ${formatUSD(parseFloat(bet.bet_amount))} each\n`
+    + `Winner gets: ~${formatUSD(parseFloat(bet.bet_amount) * 2 * 0.93)}\n\n`
+    + `${i("Do you accept?")}`,
+    {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: `✅ Accept — ${formatUSD(parseFloat(bet.bet_amount))}`, callback_data: `accept_bet_${betId}` },
+            { text: "❌ Decline", callback_data: "back_main" },
+          ],
+        ],
+      },
+    }
+  );
 }

@@ -8,7 +8,7 @@ import {
   handleSuccessfulStarsPayment, handlePendingStars, MIN_STARS
 } from "./handlers/deposit";
 import { handleWithdraw, handleWithdrawUSDT, processWithdrawAmount, processWithdrawAddress } from "./handlers/withdraw";
-import { handlePlay, handleModeSelect, handleGameSelect, handleBetSelect, processBet, handleRPSChoice, handleQuickJoin, userState } from "./handlers/play";
+import { handlePlay, handleModeSelect, handleGameSelect, handleBetSelect, processBet, handleRPSChoice, handleQuickJoin, handleAcceptFromDeepLink, userState } from "./handlers/play";
 import { handleReferral } from "./handlers/referral";
 import { handleLeaderboard } from "./handlers/leaderboard";
 import { handleTasks, handleClaimTask } from "./handlers/tasks";
@@ -21,7 +21,7 @@ import {
 import { acceptBet, cancelBet, expireOldBets } from "./services/gameService";
 import { processLockedStars } from "./services/depositService";
 import { adjustBalance, getUser } from "./services/userService";
-import { formatUSD, b, i, code } from "./utils";
+import { formatUSD, escapeHtml, b, i, code } from "./utils";
 import { query } from "./db";
 import { resolveGameByValues, formatDiceResult, telegramDiceEmoji } from "./games/engine";
 
@@ -80,7 +80,16 @@ export function initBot(): TelegramBot {
   // ─── COMMANDS ────────────────────────────────────────────────────────────────
 
   bot.onText(/\/start(.*)/, async (msg) => {
-    try { await handleStart(bot, msg); } catch (e) { logger.error(e); }
+    try {
+      const payload = (msg.text || "").split(" ")[1] || "";
+      // Deep link: /start accept_42 — let someone accept a PvP bet from private chat
+      const acceptMatch = payload.match(/^accept_(\d+)$/);
+      if (acceptMatch && msg.from) {
+        await handleAcceptFromDeepLink(bot, msg.chat.id, msg.from.id, parseInt(acceptMatch[1]));
+        return;
+      }
+      await handleStart(bot, msg);
+    } catch (e) { logger.error(e); }
   });
 
   bot.onText(/\/balance/, async (msg) => {
@@ -448,6 +457,12 @@ export function initBot(): TelegramBot {
       return;
     }
 
+    // Find open PvP bets (from private chat)
+    if (data === "find_pvp_bets") {
+      await handleQuickJoin(bot, chatId, userId);
+      return;
+    }
+
     // Cancel PvP bet
     if (data.startsWith("cancel_bet_")) {
       const betId = parseInt(data.replace("cancel_bet_", ""));
@@ -536,30 +551,75 @@ export function initBot(): TelegramBot {
   // ─── PvP Accept Bet Helper ────────────────────────────────────────────────────
 
   async function handleAcceptBet(bot: TelegramBot, chatId: number, userId: number, betId: number): Promise<void> {
-    const bet = await acceptBet(betId, userId);
-    if (!bet) { await bot.sendMessage(chatId, "❌ Bet not available or already accepted."); return; }
-
-    const betRes = await query("SELECT * FROM game_bets WHERE id=$1", [betId]);
-    const gameBet = betRes.rows[0];
-
-    await bot.sendMessage(chatId, `✅ Bet #${betId} accepted! Game starting...`);
-
-    const diceEmoji = telegramDiceEmoji(gameBet.game_type);
-    const targetChat = gameBet.group_chat_id || chatId;
-
-    if (gameBet.game_type === "rps") {
-      const { rpsKeyboard } = await import("./handlers/keyboard");
-      try {
-        await bot.sendMessage(gameBet.creator_id, `⚔️ PvP RPS! Make your choice:`, { reply_markup: rpsKeyboard(betId, true) });
-      } catch { /* ignore */ }
-      await bot.sendMessage(chatId, `⚔️ PvP RPS! Make your choice:`, { reply_markup: rpsKeyboard(betId, false) });
+    // Check balance before accepting
+    const { getUserBalance } = await import("./services/userService");
+    const betRes0 = await query("SELECT * FROM game_bets WHERE id=$1 AND status='waiting'", [betId]);
+    const pending = betRes0.rows[0];
+    if (!pending) { await bot.sendMessage(chatId, "❌ Bet not found or already accepted."); return; }
+    if (pending.creator_id === userId) { await bot.sendMessage(chatId, "❌ You can't accept your own bet!"); return; }
+    const opBal = await getUserBalance(userId);
+    if ((opBal.real + opBal.bonus) < parseFloat(pending.bet_amount)) {
+      await bot.sendMessage(chatId, `❌ ${b("Insufficient balance.")}\nYou need ${formatUSD(parseFloat(pending.bet_amount))} to accept this bet.\n\nDeposit with /deposit`, { parse_mode: "HTML" });
       return;
     }
 
+    const bet = await acceptBet(betId, userId);
+    if (!bet) { await bot.sendMessage(chatId, "❌ Bet no longer available."); return; }
+
+    const betRes = await query("SELECT gb.*, u.username, u.first_name FROM game_bets gb JOIN bot_users u ON gb.creator_id=u.id WHERE gb.id=$1", [betId]);
+    const gameBet = betRes.rows[0];
+
+    const betAmt = parseFloat(gameBet.bet_amount);
+    const creatorName = escapeHtml(gameBet.username ? `@${gameBet.username}` : gameBet.first_name || `Player#${gameBet.creator_id}`);
+    const gameLabel = gameBet.game_type.charAt(0).toUpperCase() + gameBet.game_type.slice(1);
+
+    // isPrivatePvP = no group set (both players in private chat)
+    const groupChatId: number | null = gameBet.group_chat_id ? parseInt(gameBet.group_chat_id) : null;
+    const targetChat = groupChatId || chatId;
+
+    if (gameBet.game_type === "rps") {
+      const { rpsKeyboard } = await import("./handlers/keyboard");
+      if (groupChatId) {
+        await bot.sendMessage(groupChatId, `⚔️ ${b("PvP RPS Started!")}\n${creatorName} vs You!`, { parse_mode: "HTML" });
+      }
+      // Always prompt both players in their private chats
+      try {
+        await bot.sendMessage(gameBet.creator_id, `⚔️ ${b("PvP RPS!")}\nOpponent accepted! Make your choice:`, {
+          parse_mode: "HTML",
+          reply_markup: rpsKeyboard(betId, true),
+        });
+      } catch { /* creator may not have dm'd the bot */ }
+      await bot.sendMessage(chatId, `⚔️ ${b("PvP RPS!")}\nMake your choice:`, {
+        parse_mode: "HTML",
+        reply_markup: rpsKeyboard(betId, false),
+      });
+      return;
+    }
+
+    const diceEmoji = telegramDiceEmoji(gameBet.game_type);
+    const startMsg = `⚔️ ${b("PvP " + gameLabel + " — Game On!")}\n${creatorName} vs You!\nBet: ${formatUSD(betAmt)} each`;
+
+    if (groupChatId) {
+      await bot.sendMessage(groupChatId, startMsg, { parse_mode: "HTML" });
+    } else {
+      // Private PvP — notify creator
+      try { await bot.sendMessage(gameBet.creator_id, startMsg + "\n\n🎲 Rolling dice...", { parse_mode: "HTML" }); } catch { /* ignore */ }
+      await bot.sendMessage(chatId, startMsg + "\n\n🎲 Rolling dice...", { parse_mode: "HTML" });
+    }
+
     try {
+      // Roll dice in target chat (group or acceptor's private)
       const creatorDice = await bot.sendDice(targetChat, { emoji: diceEmoji });
+      // If private PvP, also show creator their dice in their chat
+      if (!groupChatId) {
+        try { await bot.sendDice(gameBet.creator_id, { emoji: diceEmoji }); } catch { /* ignore */ }
+      }
       await new Promise(r => setTimeout(r, 3500));
+
       const opponentDice = await bot.sendDice(targetChat, { emoji: diceEmoji });
+      if (!groupChatId) {
+        try { await bot.sendDice(gameBet.creator_id, { emoji: diceEmoji }); } catch { /* ignore */ }
+      }
       await new Promise(r => setTimeout(r, 3500));
 
       const creatorVal = creatorDice.dice!.value;
@@ -576,26 +636,67 @@ export function initBot(): TelegramBot {
       );
 
       const payout = parseFloat(String(completedBet.payout));
-      const resultMsg = winner === "draw"
+      const houseFee = parseFloat(String(completedBet.house_fee));
+      const netProfit = payout - betAmt;
+
+      // Build per-player result messages
+      const creatorWon = winnerId === gameBet.creator_id;
+      const opponentWon = winnerId === userId;
+
+      const creatorResultMsg = winner === "draw"
+        ? `🤝 ${b("DRAW!")} Your bet was refunded.`
+        : creatorWon
+          ? `🏆 ${b("YOU WIN!")} +${formatUSD(netProfit)}\n${i("Fee: " + formatUSD(houseFee))}`
+          : `💀 ${b("You lost.")} -${formatUSD(betAmt)}`;
+      const opponentResultMsg = winner === "draw"
+        ? `🤝 ${b("DRAW!")} Your bet was refunded.`
+        : opponentWon
+          ? `🏆 ${b("YOU WIN!")} +${formatUSD(netProfit)}\n${i("Fee: " + formatUSD(houseFee))}`
+          : `💀 ${b("You lost.")} -${formatUSD(betAmt)}`;
+
+      // Show result in the shared chat
+      const sharedResultMsg = winner === "draw"
         ? `🤝 ${b("DRAW!")} Both players refunded.`
-        : `🏆 ${b("Player #" + winnerId + " WINS")} ${formatUSD(payout)}!`;
+        : `🏆 ${b("Winner!")} ${creatorWon ? creatorName : "Challenger"} wins ${formatUSD(payout)}!`;
 
-      await bot.sendMessage(targetChat, resultMsg, { parse_mode: "HTML" });
+      await bot.sendMessage(targetChat, sharedResultMsg, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🎮 Play Again", callback_data: "back_main" }]] },
+      });
 
-      // Notify players in private if game was in a group
-      if (gameBet.group_chat_id) {
+      // Always DM both players their personal result + updated balance
+      const creatorBal = await getUserBalance(gameBet.creator_id);
+      const opponentBal = await getUserBalance(userId);
+
+      try {
+        await bot.sendMessage(gameBet.creator_id,
+          creatorResultMsg + `\n💵 Balance: ${formatUSD(creatorBal.real)}`,
+          { parse_mode: "HTML" }
+        );
+      } catch { /* ignore */ }
+
+      // Only DM the opponent if the result chat was a group (avoid double msg in private)
+      if (groupChatId) {
         try {
-          const creatorMsg = winner === "draw" ? "🤝 Draw! Refunded." :
-            winnerId === gameBet.creator_id ? `🏆 You won ${formatUSD(payout)}!` : "💀 You lost! Better luck next time.";
-          await bot.sendMessage(gameBet.creator_id, creatorMsg);
-          const opponentMsg = winner === "draw" ? "🤝 Draw! Refunded." :
-            winnerId === userId ? `🏆 You won ${formatUSD(payout)}!` : "💀 You lost! Better luck next time.";
-          await bot.sendMessage(userId, opponentMsg);
+          await bot.sendMessage(userId,
+            opponentResultMsg + `\n💵 Balance: ${formatUSD(opponentBal.real)}`,
+            { parse_mode: "HTML" }
+          );
         } catch { /* ignore */ }
+      } else {
+        // For private PvP, send result to opponent (the acceptor) in their chat
+        await bot.sendMessage(chatId,
+          opponentResultMsg + `\n💵 Balance: ${formatUSD(opponentBal.real)}`,
+          {
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: [[{ text: "🎮 Play Again", callback_data: "back_main" }]] },
+          }
+        );
       }
+
     } catch (e) {
       logger.error(e, "Error completing PvP bet");
-      await bot.sendMessage(chatId, "❌ Error completing game. Bets refunded.");
+      await bot.sendMessage(chatId, "❌ Error during game. Bets have been refunded.");
       await cancelBet(betId);
     }
   }

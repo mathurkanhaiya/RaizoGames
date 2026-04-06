@@ -45,24 +45,26 @@ export async function getMaxDailyPayout(): Promise<number> {
 }
 
 export async function recordPayout(amount: number): Promise<void> {
+  // Pass negAmount as a separate typed param — avoids "operator is not unique: - unknown" in Postgres
+  const negAmount = -(amount);
   await query(
     `INSERT INTO house_stats (date, total_paid_out, ggr)
-     VALUES (CURRENT_DATE, $1, -$1)
+     VALUES (CURRENT_DATE, $1::numeric, $2::numeric)
      ON CONFLICT (date) DO UPDATE SET 
-       total_paid_out = house_stats.total_paid_out + $1,
-       ggr = house_stats.ggr - $1,
+       total_paid_out = house_stats.total_paid_out + $1::numeric,
+       ggr = house_stats.ggr + $2::numeric,
        updated_at = NOW()`,
-    [amount]
+    [amount, negAmount]
   );
 }
 
 export async function recordWager(amount: number): Promise<void> {
   await query(
     `INSERT INTO house_stats (date, total_wagered, ggr)
-     VALUES (CURRENT_DATE, $1, $1)
+     VALUES (CURRENT_DATE, $1::numeric, $1::numeric)
      ON CONFLICT (date) DO UPDATE SET 
-       total_wagered = house_stats.total_wagered + $1,
-       ggr = house_stats.ggr + $1,
+       total_wagered = house_stats.total_wagered + $1::numeric,
+       ggr = house_stats.ggr + $1::numeric,
        updated_at = NOW()`,
     [amount]
   );
@@ -71,9 +73,9 @@ export async function recordWager(amount: number): Promise<void> {
 export async function recordDeposit(amount: number): Promise<void> {
   await query(
     `INSERT INTO house_stats (date, total_deposits)
-     VALUES (CURRENT_DATE, $1)
+     VALUES (CURRENT_DATE, $1::numeric)
      ON CONFLICT (date) DO UPDATE SET 
-       total_deposits = house_stats.total_deposits + $1,
+       total_deposits = house_stats.total_deposits + $1::numeric,
        updated_at = NOW()`,
     [amount]
   );
@@ -82,9 +84,9 @@ export async function recordDeposit(amount: number): Promise<void> {
 export async function recordWithdrawal(amount: number): Promise<void> {
   await query(
     `INSERT INTO house_stats (date, total_withdrawals)
-     VALUES (CURRENT_DATE, $1)
+     VALUES (CURRENT_DATE, $1::numeric)
      ON CONFLICT (date) DO UPDATE SET 
-       total_withdrawals = house_stats.total_withdrawals + $1,
+       total_withdrawals = house_stats.total_withdrawals + $1::numeric,
        updated_at = NOW()`,
     [amount]
   );
