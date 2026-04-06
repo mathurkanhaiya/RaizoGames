@@ -4,7 +4,8 @@ import { recordDeposit } from "./riskService";
 import axios from "axios";
 
 const OXAPAY_API = "https://api.oxapay.com";
-const OXAPAY_KEY = process.env.OXAPAY_API_KEY!;
+const OXAPAY_KEY = process.env.OXAPAY_API_KEY || "";
+const BOT_USERNAME = process.env.BOT_USERNAME || "RaizoPvPBot";
 
 export interface DepositRecord {
   id: number;
@@ -21,8 +22,19 @@ export interface DepositRecord {
   confirmed_at?: Date;
 }
 
-export async function createOxaPayInvoice(userId: number, amountUSD: number): Promise<{ payUrl: string; orderId: string } | null> {
+export async function createOxaPayInvoice(
+  userId: number,
+  amountUSD: number
+): Promise<{ payUrl: string; orderId: string } | null> {
+  if (!OXAPAY_KEY) {
+    console.error("OXAPAY_API_KEY is not set");
+    return null;
+  }
+
   const orderId = `DEP_${userId}_${Date.now()}`;
+  const webhookUrl = process.env.WEBHOOK_URL
+    ? `${process.env.WEBHOOK_URL}/api/webhook/oxapay`
+    : "";
 
   try {
     const response = await axios.post(
@@ -31,44 +43,43 @@ export async function createOxaPayInvoice(userId: number, amountUSD: number): Pr
         merchant: OXAPAY_KEY,
         amount: amountUSD,
         currency: "USDT",
-        lifeTime: 30,
+        lifeTime: 30,         // 30 minutes
         feePaidByPayer: 0,
         underPaidCover: 5,
-        callbackUrl: `${process.env.WEBHOOK_URL || ""}/api/webhook/oxapay`,
-        returnUrl: `https://t.me/${process.env.BOT_USERNAME || "RaizoPvPBot"}`,
-        description: `RAIZO GAMES Deposit - User ${userId}`,
+        callbackUrl: webhookUrl,
+        returnUrl: `https://t.me/${BOT_USERNAME}`,
+        description: `RAIZO GAMES Deposit — User ${userId}`,
         orderId,
       },
-      { timeout: 10000 }
+      { timeout: 15000 }
     );
 
-    if (response.data?.result === 100) {
-      const trackId = response.data.trackId || orderId;
+    const data = response.data;
+    // OxaPay success: result code 100
+    if (data?.result === 100 && data?.payLink) {
+      const trackId = data.trackId || orderId;
       await query(
         `INSERT INTO deposits (user_id, method, amount, usd_amount, status, oxapay_order_id)
          VALUES ($1, 'usdt', $2, $2, 'pending', $3)`,
         [userId, amountUSD, trackId]
       );
-      return { payUrl: response.data.payLink, orderId: trackId };
+      return { payUrl: data.payLink, orderId: trackId };
     }
-  } catch {
-    // Fallback to manual deposit
+
+    // Non-100 means OxaPay returned an error
+    console.error("OxaPay non-success response:", JSON.stringify(data));
+    return null;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("OxaPay request failed:", msg);
+    return null;
   }
-
-  // Fallback — record pending deposit with a direct link
-  await query(
-    `INSERT INTO deposits (user_id, method, amount, usd_amount, status, oxapay_order_id)
-     VALUES ($1, 'usdt', $2, $2, 'pending', $3)`,
-    [userId, amountUSD, orderId]
-  );
-
-  return {
-    payUrl: `https://oxapay.com/pay/${orderId}`,
-    orderId,
-  };
 }
 
-export async function confirmOxaPayDeposit(orderId: string, amountPaid: number): Promise<boolean> {
+export async function confirmOxaPayDeposit(
+  orderId: string,
+  amountPaid: number
+): Promise<boolean> {
   const depResult = await query(
     "SELECT * FROM deposits WHERE oxapay_order_id=$1 AND status='pending'",
     [orderId]
@@ -83,12 +94,18 @@ export async function confirmOxaPayDeposit(orderId: string, amountPaid: number):
 
   await adjustBalance(dep.user_id, amountPaid, 0, "deposit", `USDT deposit via OxaPay`, orderId);
   await recordDeposit(amountPaid);
-  await grantReferralOnDeposit(dep.user_id, amountPaid);
 
+  // Update total_deposited on user
+  await query(
+    "UPDATE bot_users SET total_deposited = total_deposited + $1, updated_at=NOW() WHERE id=$2",
+    [amountPaid, dep.user_id]
+  );
+
+  await grantReferralOnDeposit(dep.user_id, amountPaid);
   return true;
 }
 
-// Record Stars deposit from a real Telegram Stars (XTR) invoice payment
+// Record a real Telegram Stars (XTR) invoice payment — 21-day lock before credit
 export async function recordStarsDeposit(
   userId: number,
   starsCount: number,
@@ -97,6 +114,7 @@ export async function recordStarsDeposit(
   const usdAmount = starsCount * 0.01;
   const lockedUntil = new Date(Date.now() + 21 * 24 * 60 * 60 * 1000);
 
+  // Use tx_hash to store the Telegram charge ID for refund purposes
   await query(
     `INSERT INTO deposits (user_id, method, amount, usd_amount, status, stars_count, locked_until, tx_hash)
      VALUES ($1, 'stars', $2, $2, 'pending', $3, $4, $5)
@@ -105,6 +123,41 @@ export async function recordStarsDeposit(
   );
 
   return { lockedUntil, usdAmount };
+}
+
+// Refund Stars using the Telegram charge ID (admin action)
+export async function refundStarsByChargeId(
+  chargeId: string
+): Promise<{ success: boolean; userId?: number; starsCount?: number; alreadyRefunded?: boolean }> {
+  const depResult = await query(
+    "SELECT * FROM deposits WHERE tx_hash=$1 AND method='stars'",
+    [chargeId]
+  );
+  const dep = depResult.rows[0];
+  if (!dep) return { success: false };
+  if (dep.status === "refunded") return { success: false, alreadyRefunded: true };
+
+  await query(
+    "UPDATE deposits SET status='refunded', confirmed_at=NOW() WHERE id=$1",
+    [dep.id]
+  );
+
+  // If already credited (confirmed), deduct the USD amount back
+  if (dep.status === "confirmed") {
+    try {
+      await adjustBalance(
+        dep.user_id,
+        -parseFloat(dep.usd_amount),
+        0,
+        "refund",
+        `Stars refund — Charge ID: ${chargeId}`
+      );
+    } catch {
+      // Balance may already be zero — still mark refunded
+    }
+  }
+
+  return { success: true, userId: dep.user_id, starsCount: dep.stars_count };
 }
 
 // Unlock Stars deposits that have passed the 21-day lock
@@ -127,6 +180,10 @@ export async function processLockedStars(): Promise<void> {
       `Stars deposit unlocked (${dep.stars_count} ⭐)`,
       String(dep.id)
     );
+    await query(
+      "UPDATE bot_users SET total_deposited = total_deposited + $1, updated_at=NOW() WHERE id=$2",
+      [parseFloat(dep.usd_amount), dep.user_id]
+    );
     await recordDeposit(parseFloat(dep.usd_amount));
     await grantReferralOnDeposit(dep.user_id, parseFloat(dep.usd_amount));
   }
@@ -148,11 +205,21 @@ async function grantReferralOnDeposit(userId: number, amount: number): Promise<v
   const user = userRes.rows[0];
   if (!user?.referral_id) return;
 
-  const wasFirstDeposit = parseFloat(user.total_deposited) === 0;
-  if (!wasFirstDeposit) return;
+  // Only first-deposit referral bonus
+  const depositCount = await query(
+    "SELECT COUNT(*) as cnt FROM deposits WHERE user_id=$1 AND status='confirmed'",
+    [userId]
+  );
+  if (parseInt(depositCount.rows[0].cnt) > 1) return;
 
   const commission = amount * 0.05;
-  await adjustBalance(user.referral_id, commission, 0, "referral", `Referral commission from user ${userId} first deposit`);
+  await adjustBalance(
+    user.referral_id,
+    commission,
+    0,
+    "referral",
+    `Referral commission from user ${userId} first deposit`
+  );
   await query(
     `INSERT INTO referral_earnings (referrer_id, referee_id, tier, amount, source_type)
      VALUES ($1, $2, 1, $3, 'deposit')`,
@@ -160,7 +227,7 @@ async function grantReferralOnDeposit(userId: number, amount: number): Promise<v
   );
 }
 
-export async function getDepositHistory(userId: number, limit = 10): Promise<DepositRecord[]> {
+export async function getDepositHistory(userId: number, limit = 20): Promise<DepositRecord[]> {
   const result = await query(
     "SELECT * FROM deposits WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2",
     [userId, limit]

@@ -1,12 +1,14 @@
 import TelegramBot from "node-telegram-bot-api";
 import { logger } from "../lib/logger";
-import { handleStart } from "./handlers/start";
+import { handleStart, handleHelp } from "./handlers/start";
 import { handleBalance, handleTransactionHistory } from "./handlers/balance";
 import {
   handleDeposit, handleDepositUSDT, handleDepositTON, handleDepositStars,
   handleStarsCustomAmount, processUSDTDepositAmount, sendStarsInvoice,
   handleSuccessfulStarsPayment, handlePendingStars, MIN_STARS
 } from "./handlers/deposit";
+import { refundStarsByChargeId } from "./services/depositService";
+import { initLogService, sendGameLog } from "./services/logService";
 import { handleWithdraw, handleWithdrawUSDT, processWithdrawAmount, processWithdrawAddress } from "./handlers/withdraw";
 import { handlePlay, handleModeSelect, handleGameSelect, handleBetSelect, processBet, handleRPSChoice, handleQuickJoin, handleAcceptFromDeepLink, userState } from "./handlers/play";
 import { handleReferral } from "./handlers/referral";
@@ -46,33 +48,41 @@ export function initBot(): TelegramBot {
   });
 
   logger.info("Telegram bot starting...");
+  initLogService(bot);
 
   // ─── REGISTER COMMANDS WITH TELEGRAM ──────────────────────────────────────
-  // This makes all commands appear in the "/" menu inside Telegram automatically
-  bot.setMyCommands([
+  // Public commands — visible to ALL users
+  const publicCommands: TelegramBot.BotCommand[] = [
     { command: "start",       description: "🏠 Start / Main menu" },
-    { command: "play",        description: "🎮 Play a game" },
-    { command: "balance",     description: "💰 Check your balance & wallet" },
+    { command: "help",        description: "📋 All commands & how to play" },
+    { command: "play",        description: "🎮 Start a game" },
+    { command: "balance",     description: "💰 Your wallet & balance" },
     { command: "deposit",     description: "📥 Deposit USDT / Stars / TON" },
     { command: "withdraw",    description: "💸 Withdraw your winnings" },
     { command: "leaderboard", description: "🏆 Top players leaderboard" },
     { command: "referral",    description: "👥 Refer friends & earn 5%" },
-    { command: "tasks",       description: "📋 Daily tasks & rewards" },
+    { command: "tasks",       description: "📋 Daily tasks & bonus rewards" },
     { command: "stats",       description: "📊 Your game statistics" },
-    { command: "join",        description: "⚡ Join an open PvP bet" },
-  ]).then(() => {
+    { command: "join",        description: "⚡ Browse open PvP bets" },
+    { command: "support",     description: "💬 Contact support" },
+  ];
+
+  bot.setMyCommands(publicCommands).then(() => {
     logger.info("Bot commands registered with Telegram");
   }).catch((err) => {
     logger.error({ err }, "Failed to register commands");
   });
 
-  // Admin-only commands (only visible to the admin user)
+  // Admin commands — ONLY visible in the admin's private chat
+  // Include public commands too so admin can see everything in one list
   bot.setMyCommands([
+    ...publicCommands,
     { command: "admin",         description: "👑 Admin panel" },
-    { command: "set",           description: "⚙️ Set risk setting (/set key value)" },
-    { command: "addbalance",    description: "➕ Add balance (/addbalance userId amount)" },
-    { command: "removebalance", description: "➖ Remove balance (/removebalance userId amount)" },
-    { command: "ban",           description: "🚫 Ban/unban user (/ban userId)" },
+    { command: "set",           description: "⚙️ /set key value" },
+    { command: "addbalance",    description: "➕ /addbalance userId amount" },
+    { command: "removebalance", description: "➖ /removebalance userId amount" },
+    { command: "ban",           description: "🚫 /ban userId" },
+    { command: "refund",        description: "↩️ /refund <chargeId> — Refund Stars" },
   ], {
     scope: { type: "chat", chat_id: parseInt(process.env.ADMIN_TELEGRAM_ID || "2139807311") },
   }).catch(() => { /* admin may not have started the bot yet */ });
@@ -90,6 +100,28 @@ export function initBot(): TelegramBot {
       }
       await handleStart(bot, msg);
     } catch (e) { logger.error(e); }
+  });
+
+  bot.onText(/\/help/, async (msg) => {
+    try { await handleHelp(bot, msg.chat.id); } catch (e) { logger.error(e); }
+  });
+
+  bot.onText(/\/support/, async (msg) => {
+    await bot.sendMessage(msg.chat.id,
+      `💬 ${b("RAIZO GAMES Support")}\n\n`
+      + `Need help? Our support team is available 24/7.\n\n`
+      + `📩 Chat: https://t.me/RaizoGamesSupport\n`
+      + `📋 /help — Command guide & game rules`,
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "💬 Open Support Chat", url: "https://t.me/RaizoGamesSupport" }],
+          ],
+        },
+      }
+    );
   });
 
   bot.onText(/\/balance/, async (msg) => {
@@ -201,6 +233,34 @@ export function initBot(): TelegramBot {
   bot.onText(/\/ban (\d+)/, async (msg, match) => {
     if (!isAdmin(msg.from!.id)) return;
     try { await handleAdminBanUser(bot, msg.chat.id, parseInt(match![1])); } catch (e) { logger.error(e); }
+  });
+
+  // Refund Stars by Telegram charge ID — admin only
+  bot.onText(/\/refund (.+)/, async (msg, match) => {
+    if (!isAdmin(msg.from!.id)) return;
+    const chargeId = match![1].trim();
+    try {
+      const result = await refundStarsByChargeId(chargeId);
+      if (result.alreadyRefunded) {
+        await bot.sendMessage(msg.chat.id, `⚠️ Charge ID already refunded previously.`);
+      } else if (!result.success) {
+        await bot.sendMessage(msg.chat.id, `❌ Charge ID not found: ${code(chargeId)}\n\nMake sure it's the Telegram charge ID from the Stars payment.`, { parse_mode: "HTML" });
+      } else {
+        await bot.sendMessage(msg.chat.id,
+          `✅ ${b("Stars Refund Processed")}\n\nCharge ID: ${code(chargeId)}\nUser: #${result.userId}\nStars: ${result.starsCount} ⭐\n\n${i("Deposit marked as refunded. Balance adjusted if already credited.")}`,
+          { parse_mode: "HTML" }
+        );
+        // Notify the user
+        try {
+          await bot.sendMessage(result.userId!,
+            `↩️ ${b("Stars Refund Received")}\n\n${result.starsCount} ⭐ have been refunded.\nCharge ID: ${code(chargeId)}`,
+            { parse_mode: "HTML" }
+          );
+        } catch { /* user may have blocked bot */ }
+      }
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${escapeHtml((e as Error).message)}`);
+    }
   });
 
   // ─── TELEGRAM STARS PAYMENT FLOW ─────────────────────────────────────────────
@@ -636,6 +696,31 @@ export function initBot(): TelegramBot {
       const payout = parseFloat(String(completedBet.payout));
       const houseFee = parseFloat(String(completedBet.house_fee));
       const netProfit = payout - betAmt;
+
+      // Send game log to channel
+      const creatorUserRes = await query("SELECT username, first_name FROM bot_users WHERE id=$1", [gameBet.creator_id]);
+      const creatorUser = creatorUserRes.rows[0];
+      const creatorDisplayName = creatorUser?.username ? `@${creatorUser.username}` : (creatorUser?.first_name || `User#${gameBet.creator_id}`);
+      const opponentUserRes = await query("SELECT username, first_name FROM bot_users WHERE id=$1", [userId]);
+      const opponentUser = opponentUserRes.rows[0];
+      const opponentDisplayName = opponentUser?.username ? `@${opponentUser.username}` : (opponentUser?.first_name || `User#${userId}`);
+      const winnerName = winnerId === gameBet.creator_id ? creatorDisplayName : (winnerId === userId ? opponentDisplayName : undefined);
+
+      sendGameLog({
+        gameType: gameBet.game_type,
+        mode: "pvp",
+        betAmount: betAmt,
+        creatorId: gameBet.creator_id,
+        creatorName: creatorDisplayName,
+        opponentId: userId,
+        opponentName: opponentDisplayName,
+        creatorResult: formatDiceResult(gameBet.game_type, creatorVal),
+        opponentResult: formatDiceResult(gameBet.game_type, opponentVal),
+        winnerId,
+        winnerName,
+        payout,
+        houseFee,
+      }).catch(() => {});
 
       // Build per-player result messages
       const creatorWon = winnerId === gameBet.creator_id;

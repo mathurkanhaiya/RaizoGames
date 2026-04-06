@@ -3,7 +3,8 @@ import { getUserBalance, getUser } from "../services/userService";
 import { createBet, completeBet, getWaitingBets } from "../services/gameService";
 import { isBotPaused, shouldBotLose, getForcePvPAbove } from "../services/riskService";
 import { generateBotDiceValue, getRPSBotChoice, formatDiceResult, telegramDiceEmoji, resolveGameByValues } from "../games/engine";
-import { formatUSD, getGameEmoji, getRPSEmoji, parseBetAmount, sleep, b, i, escapeHtml } from "../utils";
+import { formatUSD, getGameEmoji, getRPSEmoji, parseBetAmount, sleep, b, i, escapeHtml, safeUserName } from "../utils";
+import { sendGameLog } from "../services/logService";
 import { betAmountKeyboard, modeSelectKeyboard, gameSelectKeyboard, rpsKeyboard } from "./keyboard";
 
 const BOT_USERNAME = process.env.BOT_USERNAME || "RaizoPvPBot";
@@ -167,6 +168,19 @@ async function playVsBot(bot: TelegramBot, chatId: number, userId: number, gameT
     const payout = parseFloat(String(completedBet.payout));
     const netProfit = winner === "creator" ? payout - amount : 0;
 
+    // Log to channel
+    sendGameLog({
+      gameType,
+      mode: "bot",
+      betAmount: amount,
+      creatorId: userId,
+      creatorResult: playerDisplay,
+      opponentResult: botDisplay,
+      winnerId: winner === "creator" ? userId : (winner === "draw" ? null : -1),
+      payout,
+      houseFee,
+    }).catch(() => {});
+
     let resultText = `\n━━━━━━━━━━━━━━\n`;
     resultText += `🧑 You: ${playerDisplay}\n`;
     resultText += `🤖 Bot: ${botDisplay}\n\n`;
@@ -288,6 +302,19 @@ export async function handleRPSChoice(bot: TelegramBot, chatId: number, userId: 
     const houseFee = parseFloat(String(completedBet.house_fee));
     const betAmt = parseFloat(String(bet.bet_amount));
     const netProfit = winner === "creator" ? payout - betAmt : 0;
+
+    // Log to channel
+    sendGameLog({
+      gameType: "rps",
+      mode: "bot",
+      betAmount: betAmt,
+      creatorId: userId,
+      creatorResult: choice,
+      opponentResult: botChoice,
+      winnerId: winner === "creator" ? userId : (winner === "draw" ? null : -1),
+      payout,
+      houseFee,
+    }).catch(() => {});
 
     let resultText = `✊ ${b("Rock Paper Scissors")}\n\n`;
     resultText += `🧑 You: ${getRPSEmoji(choice)} ${choice}\n`;
