@@ -41,8 +41,15 @@ export async function createBet(
     [creatorId, gameType, mode, betAmount, groupChatId || null, messageId || null, expiresAt]
   );
 
-  // Deduct bet from creator balance
-  await adjustBalance(creatorId, -betAmount, 0, "bet", `Placed ${gameType} bet #${result.rows[0].id}`, String(result.rows[0].id));
+  // Deduct bet from creator balance immediately
+  await adjustBalance(
+    creatorId,
+    -betAmount,
+    0,
+    "bet",
+    `Placed ${gameType} bet #${result.rows[0].id}`,
+    String(result.rows[0].id)
+  );
 
   return result.rows[0];
 }
@@ -58,8 +65,28 @@ export async function acceptBet(betId: number, opponentId: number): Promise<Game
 
   if (bet.creator_id === opponentId) return null; // Can't accept own bet
 
+  // Check opponent has enough balance
+  const opponentRes = await query(
+    "SELECT real_balance, bonus_balance FROM bot_users WHERE id=$1",
+    [opponentId]
+  );
+  const opponentBalance =
+    parseFloat(opponentRes.rows[0]?.real_balance || "0") +
+    parseFloat(opponentRes.rows[0]?.bonus_balance || "0");
+
+  if (opponentBalance < parseFloat(bet.bet_amount)) {
+    return null; // insufficient funds
+  }
+
   // Deduct from opponent
-  await adjustBalance(opponentId, -bet.bet_amount, 0, "bet", `Accepted ${bet.game_type} bet #${betId}`, String(betId));
+  await adjustBalance(
+    opponentId,
+    -parseFloat(bet.bet_amount),
+    0,
+    "bet",
+    `Accepted ${bet.game_type} bet #${betId}`,
+    String(betId)
+  );
 
   const updated = await query(
     `UPDATE game_bets SET opponent_id=$1, status='active', updated_at=NOW() WHERE id=$2 RETURNING *`,
@@ -73,17 +100,34 @@ export async function completeBet(
   betId: number,
   creatorResult: string,
   opponentResult: string,
+  // winnerId: positive = real user won, null = draw, negative = bot won (house wins)
   winnerId: number | null,
   creatorChoice?: string,
   opponentChoice?: string
 ): Promise<GameBet> {
   const betResult = await query("SELECT * FROM game_bets WHERE id = $1", [betId]);
   const bet = betResult.rows[0];
+  if (!bet) throw new Error(`Bet #${betId} not found`);
 
+  const betAmount = parseFloat(bet.bet_amount);
   const houseEdge = await getHouseEdge(bet.game_type);
-  const houseFee = calcHouseFee(parseFloat(bet.bet_amount), bet.game_type, houseEdge);
-  const totalPot = parseFloat(bet.bet_amount) * 2;
+  const houseFee = calcHouseFee(betAmount, bet.game_type, houseEdge);
+  const totalPot = betAmount * 2;
   const payout = totalPot - houseFee;
+
+  // Store NULL in DB when bot wins (winnerId < 0) — house wins, no real user is the winner
+  const dbWinnerId = winnerId !== null && winnerId > 0 ? winnerId : null;
+  // But we still need to know if it was a draw (null) vs bot-win (negative)
+  const isBotWin = winnerId !== null && winnerId < 0;
+  const isDraw = winnerId === null;
+
+  // payout = actual amount paid out to the winner
+  // house_fee = what the house earned from this game
+  // For bot wins: house earned the full betAmount (creator's stake), payout = 0
+  // For user wins: house earned houseFee, payout = totalPot - houseFee
+  // For draw: house earned 0, payout = 0 (both refunded)
+  const dbPayout = isDraw ? 0 : isBotWin ? 0 : payout;
+  const dbHouseFee = isDraw ? 0 : isBotWin ? betAmount : houseFee;
 
   const updated = await query(
     `UPDATE game_bets SET 
@@ -97,55 +141,101 @@ export async function completeBet(
       payout=$7,
       completed_at=NOW()
      WHERE id=$8 RETURNING *`,
-    [winnerId, creatorResult, opponentResult, creatorChoice || null, opponentChoice || null, houseFee, payout, betId]
+    [
+      dbWinnerId,
+      creatorResult,
+      opponentResult,
+      creatorChoice || null,
+      opponentChoice || null,
+      dbHouseFee,
+      dbPayout,
+      betId,
+    ]
   );
 
-  // Record house stats
-  await recordWager(totalPot);
+  // Record total wager in house stats
+  await recordWager(bet.mode === "bot" ? betAmount : totalPot);
 
-  if (winnerId) {
-    // Pay winner
-    await adjustBalance(winnerId, payout, 0, "win", `Won ${bet.game_type} bet #${betId}`, String(betId));
+  if (isDraw) {
+    // Draw: refund both players
+    await adjustBalance(
+      bet.creator_id,
+      betAmount,
+      0,
+      "refund",
+      `Draw in ${bet.game_type} bet #${betId} — refund`,
+      String(betId)
+    );
+    if (bet.opponent_id) {
+      await adjustBalance(
+        bet.opponent_id,
+        betAmount,
+        0,
+        "refund",
+        `Draw in ${bet.game_type} bet #${betId} — refund`,
+        String(betId)
+      );
+    }
+  } else if (isBotWin) {
+    // Bot wins → house keeps creator's bet (already deducted from creator)
+    // No payout needed. Record house profit.
+    await recordPayout(0); // bot kept the money
+    // Creator is the loser — update their loss streak
+    await updateStreak(bet.creator_id, false);
+  } else {
+    // Real user wins
+    const realWinnerId = dbWinnerId!;
+    await adjustBalance(
+      realWinnerId,
+      payout,
+      0,
+      "win",
+      `Won ${bet.game_type} bet #${betId}`,
+      String(betId)
+    );
     await recordPayout(payout);
-    await updateStreak(winnerId, true);
+    await updateStreak(realWinnerId, true);
 
     // Update loser streak
-    const loserId = winnerId === bet.creator_id ? bet.opponent_id : bet.creator_id;
-    if (loserId) {
+    const loserId =
+      realWinnerId === bet.creator_id ? bet.opponent_id : bet.creator_id;
+    if (loserId && loserId > 0) {
       await updateStreak(loserId, false);
     }
-  } else {
-    // Draw - refund both
-    await adjustBalance(bet.creator_id, parseFloat(bet.bet_amount), 0, "win", `Draw in ${bet.game_type} bet #${betId} (refund)`, String(betId));
-    if (bet.opponent_id) {
-      await adjustBalance(bet.opponent_id, parseFloat(bet.bet_amount), 0, "win", `Draw in ${bet.game_type} bet #${betId} (refund)`, String(betId));
-    }
+
+    // Pay referral commission on win (only for real user wins)
+    await payReferralCommission(realWinnerId, betAmount);
   }
 
-  // Update wager stats
-  await addWagered(bet.creator_id, parseFloat(bet.bet_amount));
-  if (bet.opponent_id) {
-    await addWagered(bet.opponent_id, parseFloat(bet.bet_amount));
-  }
-
-  // Check referral commission
-  if (winnerId) {
-    await payReferralCommission(winnerId, parseFloat(bet.bet_amount));
+  // Track wager totals for both real players
+  await addWagered(bet.creator_id, betAmount);
+  if (bet.opponent_id && bet.opponent_id > 0) {
+    await addWagered(bet.opponent_id, betAmount);
   }
 
   return updated.rows[0];
 }
 
 async function payReferralCommission(userId: number, betAmount: number): Promise<void> {
+  if (!userId || userId <= 0) return;
+
   const userResult = await query(
     "SELECT referral_id FROM bot_users WHERE id=$1",
     [userId]
   );
   const referrerId = userResult.rows[0]?.referral_id;
-  if (!referrerId) return;
+  if (!referrerId || referrerId <= 0) return;
 
-  const commission = betAmount * 0.05; // 5% tier 1
-  await adjustBalance(referrerId, commission, 0, "referral", `Referral commission from user ${userId}`);
+  const commission = betAmount * 0.005; // 0.5% commission on wins (not 5% - that's on deposits)
+  if (commission < 0.0001) return; // too small to bother
+
+  await adjustBalance(
+    referrerId,
+    commission,
+    0,
+    "referral",
+    `Referral commission from user ${userId} game win`
+  );
   await query(
     `INSERT INTO referral_earnings (referrer_id, referee_id, tier, amount, source_type)
      VALUES ($1, $2, 1, $3, 'wager')`,
@@ -161,15 +251,31 @@ export async function cancelBet(betId: number): Promise<void> {
   const bet = betResult.rows[0];
   if (!bet) return;
 
+  // Mark as cancelled FIRST to prevent double-processing
+  await query(
+    "UPDATE game_bets SET status='cancelled', updated_at=NOW() WHERE id=$1",
+    [betId]
+  );
+
   // Refund creator
-  await adjustBalance(bet.creator_id, parseFloat(bet.bet_amount), 0, "refund", `Cancelled bet #${betId}`);
+  await adjustBalance(
+    bet.creator_id,
+    parseFloat(bet.bet_amount),
+    0,
+    "refund",
+    `Cancelled bet #${betId}`
+  );
 
-  // Refund opponent if accepted
-  if (bet.opponent_id) {
-    await adjustBalance(bet.opponent_id, parseFloat(bet.bet_amount), 0, "refund", `Cancelled bet #${betId}`);
+  // Refund opponent if they joined
+  if (bet.opponent_id && bet.opponent_id > 0) {
+    await adjustBalance(
+      bet.opponent_id,
+      parseFloat(bet.bet_amount),
+      0,
+      "refund",
+      `Cancelled bet #${betId}`
+    );
   }
-
-  await query("UPDATE game_bets SET status='cancelled' WHERE id=$1", [betId]);
 }
 
 export async function getWaitingBets(gameType?: string, groupChatId?: number): Promise<GameBet[]> {
@@ -204,12 +310,18 @@ export async function getUserBetHistory(userId: number, limit = 10): Promise<Gam
 }
 
 export async function expireOldBets(): Promise<void> {
+  // Fetch and expire in one step — cancel refunds and mark expired atomically
   const expired = await query(
     "SELECT * FROM game_bets WHERE status='waiting' AND expires_at < NOW()"
   );
 
   for (const bet of expired.rows) {
+    // First refund (cancelBet sets status to 'cancelled')
     await cancelBet(bet.id);
-    await query("UPDATE game_bets SET status='expired' WHERE id=$1", [bet.id]);
+    // Then override status to 'expired' to distinguish from user-cancelled bets
+    await query(
+      "UPDATE game_bets SET status='expired' WHERE id=$1 AND status='cancelled'",
+      [bet.id]
+    );
   }
 }

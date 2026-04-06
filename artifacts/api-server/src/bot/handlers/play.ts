@@ -163,21 +163,24 @@ async function playVsBot(bot: TelegramBot, chatId: number, userId: number, gameT
 
     const houseFee = parseFloat(String(completedBet.house_fee));
     const payout = parseFloat(String(completedBet.payout));
+    // Net profit for user = payout received - original bet deducted
+    const netProfit = winner === "creator" ? payout - amount : 0;
 
     let resultText = `\n━━━━━━━━━━━━━━\n`;
     resultText += `🧑 You: ${playerDisplay}\n`;
     resultText += `🤖 Bot: ${botDisplay}\n\n`;
 
     if (winner === "creator") {
-      resultText += `🏆 ${b("YOU WIN " + formatUSD(payout) + "!")}\n`;
+      resultText += `🏆 ${b("YOU WIN!")} +${formatUSD(netProfit)}\n`;
+      resultText += `${i("Fee: " + formatUSD(houseFee))}\n`;
     } else if (winner === "draw") {
-      resultText += `🤝 ${b("DRAW — Refunded!")}\n`;
+      resultText += `🤝 ${b("DRAW — Bet refunded!")}\n`;
     } else {
-      resultText += `💀 ${b("Bot wins. Better luck next time!")}\n`;
+      resultText += `💀 ${b("Bot wins.")} -${formatUSD(amount)}\n`;
     }
 
-    resultText += `${i("House fee: " + formatUSD(houseFee))}\n\n`;
-    resultText += `💵 Balance: ${formatUSD((await getUserBalance(userId)).real)}`;
+    const newBalance = await getUserBalance(userId);
+    resultText += `\n💵 Balance: ${formatUSD(newBalance.real)}`;
 
     await bot.sendMessage(chatId, resultText, {
       parse_mode: "HTML",
@@ -256,20 +259,24 @@ export async function handleRPSChoice(bot: TelegramBot, chatId: number, userId: 
 
     const payout = parseFloat(String(completedBet.payout));
     const houseFee = parseFloat(String(completedBet.house_fee));
+    const betAmt = parseFloat(String(bet.bet_amount));
+    const netProfit = winner === "creator" ? payout - betAmt : 0;
 
     let resultText = `✊ ${b("Rock Paper Scissors")}\n\n`;
     resultText += `🧑 You: ${getRPSEmoji(choice)} ${choice}\n`;
     resultText += `🤖 Bot: ${getRPSEmoji(botChoice)} ${botChoice}\n\n`;
 
     if (winner === "creator") {
-      resultText += `🏆 ${b("YOU WIN " + formatUSD(payout) + "!")}\n`;
+      resultText += `🏆 ${b("YOU WIN!")} +${formatUSD(netProfit)}\n`;
+      resultText += `${i("Fee: " + formatUSD(houseFee))}\n`;
     } else if (winner === "draw") {
-      resultText += `🤝 ${b("DRAW — Refunded!")}\n`;
+      resultText += `🤝 ${b("DRAW — Bet refunded!")}\n`;
     } else {
-      resultText += `💀 ${b("Bot wins!")}\n`;
+      resultText += `💀 ${b("Bot wins.")} -${formatUSD(betAmt)}\n`;
     }
-    resultText += `${i("House fee: " + formatUSD(houseFee))}\n\n`;
-    resultText += `💵 Balance: ${formatUSD((await getUserBalance(userId)).real)}`;
+
+    const newBal = await getUserBalance(userId);
+    resultText += `\n💵 Balance: ${formatUSD(newBal.real)}`;
 
     await bot.sendMessage(chatId, resultText, {
       parse_mode: "HTML",
