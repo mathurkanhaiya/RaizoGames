@@ -1,44 +1,48 @@
 # ─── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM node:20-alpine AS builder
 
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Pin pnpm to a specific version (matches lockfileVersion 9.0)
+RUN npm install -g pnpm@9
 
 WORKDIR /app
 
-# Copy workspace config files needed for pnpm install
+# Copy workspace config files
 COPY pnpm-workspace.yaml ./
 COPY pnpm-lock.yaml ./
-COPY package.json ./
 COPY tsconfig.json ./
 COPY tsconfig.base.json ./
 COPY .npmrc ./
 
-# Copy lib package manifests (workspace deps)
+# Copy root package.json but skip its preinstall script (it blocks non-interactive envs)
+COPY package.json ./
+RUN pnpm pkg delete scripts.preinstall
+
+# Copy lib workspace package manifests
 COPY lib/api-zod/package.json lib/api-zod/
 COPY lib/db/package.json lib/db/
 
 # Copy api-server package manifest
 COPY artifacts/api-server/package.json artifacts/api-server/
 
-# Install all deps (including devDeps for build)
+# Install all deps (dev + prod needed for build)
 RUN pnpm install --frozen-lockfile --filter @workspace/api-server...
 
-# Copy source files
+# Copy source
 COPY lib/api-zod/src lib/api-zod/src
 COPY lib/db/src lib/db/src
 COPY artifacts/api-server/src artifacts/api-server/src
 COPY artifacts/api-server/build.mjs artifacts/api-server/build.mjs
 COPY artifacts/api-server/tsconfig.json artifacts/api-server/tsconfig.json
 
-# Build — esbuild bundles everything into dist/index.mjs (self-contained)
+# Build — esbuild bundles everything into a self-contained dist/index.mjs
 RUN pnpm --filter @workspace/api-server run build
 
-# ─── Stage 2: Production image ────────────────────────────────────────────────
+# ─── Stage 2: Minimal production image ────────────────────────────────────────
 FROM node:20-alpine AS runner
 
 WORKDIR /app
 
-# esbuild bundles all JS deps; dist is fully self-contained
+# dist is fully self-contained — no node_modules needed at runtime
 COPY --from=builder /app/artifacts/api-server/dist ./dist
 
 ENV NODE_ENV=production
