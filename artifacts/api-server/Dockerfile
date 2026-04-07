@@ -25,7 +25,7 @@ COPY lib/db/package.json lib/db/
 COPY artifacts/api-server/package.json artifacts/api-server/
 
 # Install all deps (dev + prod needed for build)
-RUN pnpm install --frozen-lockfile --filter @workspace/api-server...
+RUN pnpm install --no-frozen-lockfile --filter @workspace/api-server...
 
 # Copy source
 COPY lib/api-zod/src lib/api-zod/src
