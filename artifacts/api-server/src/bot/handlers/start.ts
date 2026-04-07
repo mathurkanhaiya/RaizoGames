@@ -2,6 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 import { getOrCreateUser, giveNewbieBonus, getUserBalance } from "../services/userService";
 import { formatUSD, escapeHtml, b, i, code } from "../utils";
 import { mainMenuKeyboard } from "./keyboard";
+import { logger } from "../../lib/logger";
 
 const SUPPORT_LINK = "https://t.me/RaizoGamesSupport";
 const CHANNEL_LINK = "https://t.me/raizologs";
@@ -77,6 +78,7 @@ export async function handleStart(bot: TelegramBot, msg: TelegramBot.Message): P
       reply_markup: mainMenuKeyboard(),
     });
   } catch (err) {
+    logger.error({ err }, "handleStart error");
     await bot.sendMessage(chatId, "⚠️ Something went wrong. Please try again.");
   }
 }
