@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { confirmOxaPayDeposit } from "../bot/services/depositService";
+import { processUpdate } from "../bot/bot";
 import { logger } from "../lib/logger";
 
 const router = Router();
@@ -24,6 +25,17 @@ router.post("/webhook/oxapay", async (req, res) => {
   } catch (err) {
     logger.error({ err }, "OxaPay webhook error");
     res.status(500).json({ error: "Webhook processing failed" });
+  }
+});
+
+// Telegram webhook handler (used in production/Railway — webhook mode)
+router.post("/webhook/telegram", (req, res) => {
+  try {
+    processUpdate(req.body);
+    res.sendStatus(200);
+  } catch (err) {
+    logger.error({ err }, "Telegram webhook error");
+    res.sendStatus(200); // Always 200 — Telegram retries on non-200
   }
 });
 

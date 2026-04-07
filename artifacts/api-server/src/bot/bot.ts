@@ -34,6 +34,13 @@ import { resolveGameByValues, formatDiceResult, telegramDiceEmoji } from "./game
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 
+// Singleton bot instance — used by webhook route in production
+let _botInstance: TelegramBot | null = null;
+export function getBotInstance(): TelegramBot | null { return _botInstance; }
+export function processUpdate(update: TelegramBot.Update): void {
+  if (_botInstance) _botInstance.processUpdate(update);
+}
+
 // Per-user multi-step state
 const pendingWithdrawAmount = new Map<number, number>();
 const pendingAdminLookup = new Set<number>();
@@ -44,18 +51,38 @@ const pendingAddBalance = new Map<number, number>(); // admin: userId to add bal
 const pendingRmBalance = new Map<number, number>();  // admin: userId to remove balance from
 
 export function initBot(): TelegramBot {
-  const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-  // Global error guards — never let unhandled rejections kill the process
-  bot.on("polling_error", (err) => {
-    logger.error({ err: err.message }, "Telegram polling error");
+  // Global crash guards — must be set before ANYTHING that can throw
+  process.on("uncaughtException", (err) => {
+    logger.error({ err: err.message }, "Uncaught exception — keeping process alive");
   });
-
   process.on("unhandledRejection", (reason) => {
-    logger.error({ reason }, "Unhandled rejection");
+    logger.error({ reason }, "Unhandled rejection — keeping process alive");
   });
 
-  logger.info("Telegram bot starting...");
+  const WEBHOOK_URL = process.env.WEBHOOK_URL;
+  const useWebhook = !!WEBHOOK_URL;
+
+  // Webhook mode (Railway/production): Telegram pushes updates to our URL — no 409 conflicts
+  // Polling mode (Replit/dev): bot polls Telegram — convenient for local dev
+  const bot = new TelegramBot(BOT_TOKEN, useWebhook ? {} : { polling: true });
+
+  if (!useWebhook) {
+    bot.on("polling_error", (err) => {
+      logger.error({ err: err.message }, "Telegram polling error");
+    });
+  }
+
+  logger.info({ mode: useWebhook ? "webhook" : "polling" }, "Telegram bot starting...");
+
+  if (useWebhook) {
+    const webhookPath = `/api/webhook/telegram`;
+    const fullWebhookUrl = `${WEBHOOK_URL}${webhookPath}`;
+    bot.setWebHook(fullWebhookUrl).then(() => {
+      logger.info({ url: fullWebhookUrl }, "Telegram webhook set");
+    }).catch((err) => {
+      logger.error({ err: err.message }, "Failed to set Telegram webhook");
+    });
+  }
   initLogService(bot);
 
   // ─── REGISTER COMMANDS WITH TELEGRAM ──────────────────────────────────────
@@ -805,6 +832,7 @@ export function initBot(): TelegramBot {
     } catch { /* ignore */ }
   }, 24 * 60 * 60 * 1000);
 
+  _botInstance = bot;
   logger.info("Telegram bot initialized successfully!");
   return bot;
 
