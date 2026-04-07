@@ -22,8 +22,7 @@ import {
   handleAdminUserDetail, handleAdminRiskSettings, handleAdminBanUser,
   handleAdminSetSetting, handleAdminRecentGames, handleAdminTopWinners,
   handleAdminBonusCodes, handleAdminViewTasks, handleAdminAllUsers,
-  handleAdminViewUser, handleAdminUserGames,
-  handleAdminPendingDeposits, handleAdminConfirmDeposit
+  handleAdminViewUser, handleAdminUserGames
 } from "./handlers/admin";
 import { acceptBet, cancelBet, expireOldBets } from "./services/gameService";
 // processLockedStars removed — Stars now instant (no lock)
@@ -951,13 +950,6 @@ export function initBot(): TelegramBot {
       if (data === "admin_bonus_codes")          { await handleAdminBonusCodes(bot, chatId); return; }
       if (data === "admin_view_tasks")           { await handleAdminViewTasks(bot, chatId); return; }
       if (data === "admin_all_users")            { await handleAdminAllUsers(bot, chatId); return; }
-      if (data === "admin_pending_deposits")     { await handleAdminPendingDeposits(bot, chatId); return; }
-
-      if (data.startsWith("admin_confirm_deposit_")) {
-        const depositId = parseInt(data.replace("admin_confirm_deposit_", ""));
-        if (!isNaN(depositId)) await handleAdminConfirmDeposit(bot, chatId, depositId);
-        return;
-      }
 
       if (data === "admin_broadcast") {
         pendingBroadcast.add(userId);

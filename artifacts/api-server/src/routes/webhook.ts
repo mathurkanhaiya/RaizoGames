@@ -6,53 +6,25 @@ import { logger } from "../lib/logger";
 const router = Router();
 
 // OxaPay webhook handler
-// OxaPay sends: { type, status, trackId, orderId, amount, currency, txID, ... }
 router.post("/webhook/oxapay", async (req, res) => {
-  // Always respond 200 immediately — OxaPay retries on non-200
-  res.json({ result: 100 });
-
   try {
-    const body = req.body;
+    const { status, trackId, amount, currency } = req.body;
 
-    // Log the FULL payload so we can debug in Railway logs
-    logger.info({ body }, "OxaPay webhook received");
+    req.log.info({ trackId, status, amount }, "OxaPay webhook received");
 
-    const status: string = body.status || body.Status || "";
-    // trackId may be number or string from OxaPay
-    const trackId: string = String(body.trackId || body.TrackId || body.track_id || "");
-    // Also try orderId as fallback lookup key
-    const orderId: string = String(body.orderId || body.OrderId || body.order_id || "");
-    // Amount in USDT
-    const amount = parseFloat(body.amount || body.Amount || body.netAmount || "0");
-
-    logger.info({ status, trackId, orderId, amount }, "OxaPay webhook parsed");
-
-    // Accept Paid or Confirming as valid payment status
-    if (status === "Paid" || status === "Confirming" || status === "paid" || status === "confirming") {
-      if (amount <= 0) {
-        logger.warn({ body }, "OxaPay webhook: amount is 0 or missing");
-        return;
-      }
-
-      // Try trackId first, then orderId as fallback
-      let confirmed = false;
-      if (trackId) {
-        confirmed = await confirmOxaPayDeposit(trackId, amount);
-      }
-      if (!confirmed && orderId) {
-        confirmed = await confirmOxaPayDeposit(orderId, amount);
-      }
+    if (status === "Paid" || status === "Confirming") {
+      const amountUSD = parseFloat(amount) || 0;
+      const confirmed = await confirmOxaPayDeposit(trackId, amountUSD);
 
       if (confirmed) {
-        logger.info({ trackId, orderId, amount }, "OxaPay deposit confirmed — balance credited");
-      } else {
-        logger.warn({ trackId, orderId, amount }, "OxaPay webhook: deposit not found or already confirmed");
+        req.log.info({ trackId, amountUSD }, "OxaPay deposit confirmed");
       }
-    } else {
-      logger.info({ status }, "OxaPay webhook: non-payment status, skipping");
     }
+
+    res.json({ result: 100 });
   } catch (err) {
-    logger.error({ err }, "OxaPay webhook processing error");
+    logger.error({ err }, "OxaPay webhook error");
+    res.status(500).json({ error: "Webhook processing failed" });
   }
 });
 
