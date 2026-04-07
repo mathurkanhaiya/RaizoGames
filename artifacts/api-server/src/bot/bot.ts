@@ -62,24 +62,31 @@ export function initBot(): TelegramBot {
 
   const WEBHOOK_URL = process.env.WEBHOOK_URL;
   const useWebhook = !!WEBHOOK_URL;
+  // Polling must be explicitly opted-in via ENABLE_DEV_POLLING=true
+  // This prevents Replit dev server from calling deleteWebhook and wiping the Railway webhook
+  const usePolling = !useWebhook && process.env.ENABLE_DEV_POLLING === "true";
 
-  // Webhook mode (Railway/production): Telegram pushes updates to our URL — no 409 conflicts
-  // Polling mode (Replit/dev): bot polls Telegram — convenient for local dev
-  const bot = new TelegramBot(BOT_TOKEN, useWebhook ? {} : { polling: true });
+  // Webhook mode (Railway/production): Telegram pushes updates to our URL
+  // Polling mode (dev only, opt-in): bot polls Telegram — set ENABLE_DEV_POLLING=true to activate
+  // Silent mode (Replit default): Express server runs but bot is passive — Railway owns the webhook
+  const bot = new TelegramBot(BOT_TOKEN, usePolling ? { polling: true } : {});
 
-  if (!useWebhook) {
+  if (usePolling) {
     bot.on("polling_error", (err) => {
       logger.error({ err: err.message }, "Telegram polling error");
     });
+    logger.info("Telegram bot starting in POLLING mode (dev)");
+  } else if (useWebhook) {
+    logger.info({ mode: "webhook" }, "Telegram bot starting...");
+  } else {
+    logger.info("Telegram bot in PASSIVE mode — Railway owns the webhook (set ENABLE_DEV_POLLING=true to poll locally)");
   }
-
-  logger.info({ mode: useWebhook ? "webhook" : "polling" }, "Telegram bot starting...");
 
   if (useWebhook) {
     const webhookPath = `/api/webhook/telegram`;
     const fullWebhookUrl = `${WEBHOOK_URL}${webhookPath}`;
     bot.setWebHook(fullWebhookUrl).then(() => {
-      logger.info({ url: fullWebhookUrl }, "Telegram webhook set");
+      logger.info({ url: fullWebhookUrl }, "Telegram webhook registered successfully");
     }).catch((err) => {
       logger.error({ err: err.message }, "Failed to set Telegram webhook");
     });
