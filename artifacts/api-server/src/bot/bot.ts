@@ -15,12 +15,14 @@ import { handleWithdraw, handleWithdrawUSDT, processWithdrawAmount, processWithd
 import { handlePlay, handleModeSelect, handleGameSelect, handleBetSelect, processBet, handleRPSChoice, handleQuickJoin, handleAcceptFromDeepLink, userState } from "./handlers/play";
 import { handleReferral } from "./handlers/referral";
 import { handleLeaderboard } from "./handlers/leaderboard";
-import { handleTasks, handleClaimTask } from "./handlers/tasks";
+import { handleTasks, handleClaimTask, updateTaskProgress } from "./handlers/tasks";
 import {
   isAdmin, handleAdminPanel, handleAdminProfit, handleAdminPendingWithdrawals,
   handleAdminApproveWithdrawal, handleAdminRejectWithdrawal, handleAdminUserLookup,
   handleAdminUserDetail, handleAdminRiskSettings, handleAdminBanUser,
-  handleAdminSetSetting, handleAdminRecentGames, handleAdminTopWinners
+  handleAdminSetSetting, handleAdminRecentGames, handleAdminTopWinners,
+  handleAdminBonusCodes, handleAdminViewTasks, handleAdminAllUsers,
+  handleAdminViewUser, handleAdminUserGames
 } from "./handlers/admin";
 import { acceptBet, cancelBet, expireOldBets } from "./services/gameService";
 // processLockedStars removed — Stars now instant (no lock)
@@ -37,6 +39,9 @@ const pendingWithdrawAmount = new Map<number, number>();
 const pendingAdminLookup = new Set<number>();
 const pendingStarsCustom = new Set<number>(); // users who clicked "Custom Amount" for Stars
 const pendingRedeem = new Set<number>();       // users waiting to enter a bonus code
+const pendingBroadcast = new Set<number>();    // admin broadcast message
+const pendingAddBalance = new Map<number, number>(); // admin: userId to add balance to
+const pendingRmBalance = new Map<number, number>();  // admin: userId to remove balance from
 
 export function initBot(): TelegramBot {
   const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -276,17 +281,33 @@ export function initBot(): TelegramBot {
     } catch (e) { logger.error(e); }
   });
 
-  // Quick bet: /bet dice 0.5
+  // Quick bet: /bet dice 0.5 — or /bet alone for usage
+  const BET_USAGE =
+    `💡 ${b("Usage:")} ${code("/bet <game> <amount>")}\n\n`
+    + `🎮 Games: dice · slots · rps · basketball · bowling · darts · football\n`
+    + `💰 Min bet: $0.02\n\n`
+    + `${i("Example: /bet dice 0.5")}`;
+
+  bot.onText(/^\/bet$/, async (msg) => {
+    await bot.sendMessage(msg.chat.id, BET_USAGE, { parse_mode: "HTML" });
+  });
+
   bot.onText(/\/bet (.+) (.+)/, async (msg, match) => {
     const gameType = match![1].toLowerCase();
     const amount = parseFloat(match![2]);
     const validGames = ["dice", "slots", "rps", "basketball", "bowling", "darts", "football"];
     if (!validGames.includes(gameType)) {
-      await bot.sendMessage(msg.chat.id, `❌ Invalid game. Valid: ${validGames.join(", ")}`);
+      await bot.sendMessage(msg.chat.id,
+        `❌ Unknown game: ${code(escapeHtml(gameType))}\n\n${BET_USAGE}`,
+        { parse_mode: "HTML" }
+      );
       return;
     }
     if (isNaN(amount) || amount < 0.02) {
-      await bot.sendMessage(msg.chat.id, "❌ Invalid amount. Min: $0.02");
+      await bot.sendMessage(msg.chat.id,
+        `❌ Invalid amount. Min is $0.02\n\n${BET_USAGE}`,
+        { parse_mode: "HTML" }
+      );
       return;
     }
     const mode = msg.chat.type === "private" ? "bot" : "pvp";
@@ -683,11 +704,56 @@ export function initBot(): TelegramBot {
       return;
     }
 
-    // Admin user lookup reply
-    if (isAdmin(userId) && pendingAdminLookup.has(userId)) {
-      pendingAdminLookup.delete(userId);
-      try { await handleAdminUserDetail(bot, chatId, text); } catch (e) { logger.error(e); }
-      return;
+    // Admin flows
+    if (isAdmin(userId)) {
+      if (pendingAdminLookup.has(userId)) {
+        pendingAdminLookup.delete(userId);
+        try { await handleAdminUserDetail(bot, chatId, text); } catch (e) { logger.error(e); }
+        return;
+      }
+
+      if (pendingBroadcast.has(userId)) {
+        pendingBroadcast.delete(userId);
+        try {
+          const allUsers = await query("SELECT id FROM bot_users WHERE is_banned=FALSE");
+          let sent = 0, failed = 0;
+          await bot.sendMessage(chatId, `📢 Broadcasting to ${allUsers.rows.length} users...`);
+          for (const u of allUsers.rows) {
+            try {
+              await bot.sendMessage(u.id, `📢 ${b("RAIZO GAMES Announcement")}\n\n` + text, { parse_mode: "HTML" });
+              sent++;
+            } catch { failed++; }
+            await new Promise(r => setTimeout(r, 50)); // rate limit
+          }
+          await bot.sendMessage(chatId, `✅ Broadcast complete: ${sent} sent, ${failed} failed.`);
+        } catch (e) { logger.error(e); }
+        return;
+      }
+
+      if (pendingAddBalance.has(userId)) {
+        const targetId = pendingAddBalance.get(userId)!;
+        pendingAddBalance.delete(userId);
+        const amount = parseFloat(text);
+        if (isNaN(amount) || amount <= 0) { await bot.sendMessage(chatId, "❌ Invalid amount."); return; }
+        try {
+          await adjustBalance(targetId, amount, 0, "admin_add", `Admin added ${formatUSD(amount)}`);
+          await bot.sendMessage(chatId, `✅ Added ${formatUSD(amount)} to user #${targetId}`);
+          try { await bot.sendMessage(targetId, `💰 ${b("Admin topped up your balance by " + formatUSD(amount))}!`, { parse_mode: "HTML" }); } catch { /* ignored */ }
+        } catch (e) { await bot.sendMessage(chatId, `❌ Error: ${escapeHtml((e as Error).message)}`); }
+        return;
+      }
+
+      if (pendingRmBalance.has(userId)) {
+        const targetId = pendingRmBalance.get(userId)!;
+        pendingRmBalance.delete(userId);
+        const amount = parseFloat(text);
+        if (isNaN(amount) || amount <= 0) { await bot.sendMessage(chatId, "❌ Invalid amount."); return; }
+        try {
+          await adjustBalance(targetId, -amount, 0, "admin_remove", `Admin removed ${formatUSD(amount)}`);
+          await bot.sendMessage(chatId, `✅ Removed ${formatUSD(amount)} from user #${targetId}`);
+        } catch (e) { await bot.sendMessage(chatId, `❌ Error: ${escapeHtml((e as Error).message)}`); }
+        return;
+      }
     }
   });
 
@@ -837,7 +903,8 @@ export function initBot(): TelegramBot {
       return;
     }
 
-    // Tasks: claim reward
+    // Tasks: show and claim
+    if (data === "show_tasks") { await handleTasks(bot, chatId, userId); return; }
     if (data.startsWith("claim_task_")) {
       const taskId = parseInt(data.replace("claim_task_", ""));
       await handleClaimTask(bot, callbackQueryId, chatId, userId, taskId);
@@ -846,17 +913,33 @@ export function initBot(): TelegramBot {
 
     // ── Admin callbacks ──────────────────────────────────────────────────────────
     if (isAdmin(userId)) {
+      if (data === "admin_panel")                { await handleAdminPanel(bot, chatId); return; }
       if (data === "admin_profit")               { await handleAdminProfit(bot, chatId); return; }
       if (data === "admin_pending_withdrawals")  { await handleAdminPendingWithdrawals(bot, chatId); return; }
       if (data === "admin_risk_settings")        { await handleAdminRiskSettings(bot, chatId); return; }
       if (data === "admin_recent_games")         { await handleAdminRecentGames(bot, chatId); return; }
       if (data === "admin_top_winners")          { await handleAdminTopWinners(bot, chatId); return; }
+      if (data === "admin_bonus_codes")          { await handleAdminBonusCodes(bot, chatId); return; }
+      if (data === "admin_view_tasks")           { await handleAdminViewTasks(bot, chatId); return; }
+      if (data === "admin_all_users")            { await handleAdminAllUsers(bot, chatId); return; }
+
+      if (data === "admin_broadcast") {
+        pendingBroadcast.add(userId);
+        await bot.sendMessage(chatId,
+          `📢 ${b("Broadcast Message")}\n\nType the message to send to all users:\n${i("HTML formatting is supported.")}`,
+          { parse_mode: "HTML", reply_markup: { force_reply: true, input_field_placeholder: "Your announcement..." } }
+        );
+        return;
+      }
 
       if (data === "admin_user_lookup") {
         pendingAdminLookup.add(userId);
         await handleAdminUserLookup(bot, chatId);
         return;
       }
+
+      const viewUserMatch = data.match(/^admin_view_user_(\d+)$/);
+      if (viewUserMatch) { await handleAdminViewUser(bot, chatId, parseInt(viewUserMatch[1])); return; }
 
       const approveMatch = data.match(/^admin_approve_(\d+)$/);
       if (approveMatch) { await handleAdminApproveWithdrawal(bot, chatId, parseInt(approveMatch[1])); return; }
@@ -877,6 +960,37 @@ export function initBot(): TelegramBot {
         }
         return;
       }
+
+      const addBalMatch = data.match(/^admin_add_bal_(\d+)$/);
+      if (addBalMatch) {
+        const targetId = parseInt(addBalMatch[1]);
+        pendingAddBalance.set(userId, targetId);
+        await bot.sendMessage(chatId, `➕ Enter amount to add to user #${targetId}:`, {
+          reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD" },
+        });
+        return;
+      }
+
+      const rmBalMatch = data.match(/^admin_rm_bal_(\d+)$/);
+      if (rmBalMatch) {
+        const targetId = parseInt(rmBalMatch[1]);
+        pendingRmBalance.set(userId, targetId);
+        await bot.sendMessage(chatId, `➖ Enter amount to remove from user #${targetId}:`, {
+          reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD" },
+        });
+        return;
+      }
+
+      const resetWagerMatch = data.match(/^admin_reset_wager_(\d+)$/);
+      if (resetWagerMatch) {
+        const targetId = parseInt(resetWagerMatch[1]);
+        await query("UPDATE bot_users SET wager_requirement=0, updated_at=NOW() WHERE id=$1", [targetId]);
+        await bot.sendMessage(chatId, `✅ Wager requirement reset for user #${targetId}`);
+        return;
+      }
+
+      const userGamesMatch = data.match(/^admin_user_games_(\d+)$/);
+      if (userGamesMatch) { await handleAdminUserGames(bot, chatId, parseInt(userGamesMatch[1])); return; }
     }
   }
 
@@ -993,6 +1107,27 @@ export function initBot(): TelegramBot {
         payout,
         houseFee,
       }).catch(() => {});
+
+      // Update task progress for both players
+      const wagerFloor = Math.floor(betAmt);
+      const [cr1, cw1] = await Promise.all([
+        updateTaskProgress(gameBet.creator_id, "play_games", 1),
+        updateTaskProgress(gameBet.creator_id, "wager_amount", wagerFloor),
+      ]);
+      const [cr2, cw2] = await Promise.all([
+        updateTaskProgress(userId, "play_games", 1),
+        updateTaskProgress(userId, "wager_amount", wagerFloor),
+      ]);
+      const creatorDone = [...cr1.justCompleted, ...cw1.justCompleted];
+      const opponentDone = [...cr2.justCompleted, ...cw2.justCompleted];
+      if (creatorDone.length > 0) {
+        const msg = creatorDone.map(t => `🎁 Task done: ${b(t.name)} — /tasks to claim ${formatUSD(t.reward)}!`).join("\n");
+        try { await bot.sendMessage(gameBet.creator_id, msg, { parse_mode: "HTML" }); } catch { /* ignored */ }
+      }
+      if (opponentDone.length > 0) {
+        const msg = opponentDone.map(t => `🎁 Task done: ${b(t.name)} — /tasks to claim ${formatUSD(t.reward)}!`).join("\n");
+        try { await bot.sendMessage(userId, msg, { parse_mode: "HTML" }); } catch { /* ignored */ }
+      }
 
       // Build per-player result messages
       const creatorWon = winnerId === gameBet.creator_id;

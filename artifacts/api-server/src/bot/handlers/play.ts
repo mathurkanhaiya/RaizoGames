@@ -1,6 +1,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import { getUserBalance, getUser } from "../services/userService";
 import { createBet, completeBet, getWaitingBets } from "../services/gameService";
+import { updateTaskProgress } from "./tasks";
 import { isBotPaused, shouldBotLose, getForcePvPAbove } from "../services/riskService";
 import { generateBotDiceValue, getRPSBotChoice, formatDiceResult, telegramDiceEmoji, resolveGameByValues } from "../games/engine";
 import { formatUSD, getGameEmoji, getRPSEmoji, parseBetAmount, sleep, b, i, escapeHtml, safeUserName } from "../utils";
@@ -110,9 +111,28 @@ export async function processBet(bot: TelegramBot, chatId: number, userId: numbe
   if (mode === "bot") {
     await playVsBot(bot, chatId, userId, gameType, amount);
   } else {
-    // Detect if this is a group chat or private chat
-    const isGroup = chatId < 0;
-    await createPvPBet(bot, chatId, userId, gameType, amount, isGroup);
+    // PvP only works in group chats — private is not supported
+    if (chatId > 0) {
+      await bot.sendMessage(chatId,
+        `⚔️ ${b("PvP Requires a Group Chat")}\n\n`
+        + `PvP bets can only be created in a Telegram group.\n\n`
+        + `${b("How to play PvP:")}\n`
+        + `1. Add @${BOT_USERNAME} to your group\n`
+        + `2. Use /play or /bet in the group\n`
+        + `3. Another player can accept your bet there\n\n`
+        + `${i("Or switch to vs Bot mode to play right here!")}`,
+        {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "🤖 Play vs Bot Instead", callback_data: `game_bot_${gameType}` }],
+            ],
+          },
+        }
+      );
+      return;
+    }
+    await createPvPBet(bot, chatId, userId, gameType, amount, true);
   }
 }
 
@@ -180,6 +200,15 @@ async function playVsBot(bot: TelegramBot, chatId: number, userId: number, gameT
       payout,
       houseFee,
     }).catch(() => {});
+
+    // Update task progress
+    const taskResults = await updateTaskProgress(userId, "play_games", 1);
+    const wagerTaskResults = await updateTaskProgress(userId, "wager_amount", Math.floor(amount));
+    const newlyDone = [...taskResults.justCompleted, ...wagerTaskResults.justCompleted];
+    if (newlyDone.length > 0) {
+      const taskMsg = newlyDone.map(t => `🎁 Task completed: ${b(t.name)} — Tap /tasks to claim ${formatUSD(t.reward)}!`).join("\n");
+      await bot.sendMessage(chatId, taskMsg, { parse_mode: "HTML" });
+    }
 
     let resultText = `\n━━━━━━━━━━━━━━\n`;
     resultText += `🧑 You: ${playerDisplay}\n`;
