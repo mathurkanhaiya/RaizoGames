@@ -11,10 +11,8 @@ export async function setupDatabase(): Promise<void> {
       last_name VARCHAR(255),
       real_balance NUMERIC(18,8) NOT NULL DEFAULT 0,
       bonus_balance NUMERIC(18,8) NOT NULL DEFAULT 0,
-      bonus_wager_requirement NUMERIC(18,8) NOT NULL DEFAULT 0,
       total_wagered NUMERIC(18,8) NOT NULL DEFAULT 0,
       total_deposited NUMERIC(18,8) NOT NULL DEFAULT 0,
-      total_withdrawn NUMERIC(18,8) NOT NULL DEFAULT 0,
       referral_code VARCHAR(32) UNIQUE,
       referral_id BIGINT REFERENCES bot_users(id),
       is_vip BOOLEAN NOT NULL DEFAULT FALSE,
@@ -27,32 +25,10 @@ export async function setupDatabase(): Promise<void> {
       consecutive_bot_losses INT NOT NULL DEFAULT 0,
       last_daily_claim TIMESTAMPTZ,
       last_weekly_claim TIMESTAMPTZ,
-      last_withdraw_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-
-  // ── Migrations: safely add columns that may be missing from older deployments ──
-  const migrations = [
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS bonus_wager_requirement NUMERIC(18,8) NOT NULL DEFAULT 0`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS total_withdrawn NUMERIC(18,8) NOT NULL DEFAULT 0`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS last_withdraw_at TIMESTAMPTZ`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS newbie_bonus_expires_at TIMESTAMPTZ`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS win_streak INT NOT NULL DEFAULT 0`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS loss_streak INT NOT NULL DEFAULT 0`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS consecutive_bot_losses INT NOT NULL DEFAULT 0`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS last_daily_claim TIMESTAMPTZ`,
-    `ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS last_weekly_claim TIMESTAMPTZ`,
-    `ALTER TABLE deposits ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ`,
-    `ALTER TABLE deposits ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ`,
-    `ALTER TABLE deposits ADD COLUMN IF NOT EXISTS stars_count INT`,
-    `ALTER TABLE deposits ADD COLUMN IF NOT EXISTS tx_hash VARCHAR(255)`,
-    `ALTER TABLE deposits ADD COLUMN IF NOT EXISTS oxapay_order_id VARCHAR(255)`,
-  ];
-  for (const sql of migrations) {
-    try { await query(sql); } catch { /* column already exists — safe to ignore */ }
-  }
 
   await query(`
     CREATE TABLE IF NOT EXISTS transactions (
