@@ -46,7 +46,6 @@ WORKDIR /app
 COPY --from=builder /app/artifacts/api-server/dist ./dist
 
 ENV NODE_ENV=production
-ENV PORT=3000
 
 EXPOSE 3000
 
