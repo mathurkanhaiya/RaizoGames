@@ -2,6 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 import { query } from "../db";
 import { getUser, adjustBalance } from "../services/userService";
 import { approveWithdrawal, rejectWithdrawal, getPendingWithdrawals } from "../services/withdrawService";
+import { confirmOxaPayDeposit } from "../services/depositService";
 import { getHouseProfitDashboard, setSetting, getSettings } from "../services/riskService";
 import { formatUSD, formatDate, b, i, code, escapeHtml } from "../utils";
 
@@ -65,7 +66,11 @@ export async function handleAdminPanel(bot: TelegramBot, chatId: number): Promis
         ],
         [
           { text: "💸 Withdrawals", callback_data: "admin_pending_withdrawals" },
+          { text: "💳 Deposits", callback_data: "admin_pending_deposits" },
+        ],
+        [
           { text: "🔍 User Lookup", callback_data: "admin_user_lookup" },
+          { text: "👥 All Users", callback_data: "admin_all_users" },
         ],
         [
           { text: "🎮 Recent Games", callback_data: "admin_recent_games" },
@@ -76,7 +81,6 @@ export async function handleAdminPanel(bot: TelegramBot, chatId: number): Promis
           { text: "📋 Active Tasks", callback_data: "admin_view_tasks" },
         ],
         [
-          { text: "👥 All Users", callback_data: "admin_all_users" },
           { text: "📢 Broadcast", callback_data: "admin_broadcast" },
         ],
         [{ text: "🔄 Refresh", callback_data: "admin_panel" }],
@@ -500,4 +504,78 @@ export async function handleAdminUserGames(bot: TelegramBot, chatId: number, use
   }
 
   await bot.sendMessage(chatId, text, { parse_mode: "HTML" });
+}
+
+// ─── PENDING DEPOSITS ─────────────────────────────────────────────────────────
+
+export async function handleAdminPendingDeposits(bot: TelegramBot, chatId: number): Promise<void> {
+  const res = await query(
+    `SELECT d.*, u.username, u.first_name 
+     FROM deposits d JOIN bot_users u ON d.user_id = u.id
+     WHERE d.status = 'pending' AND d.method = 'usdt'
+     ORDER BY d.created_at DESC LIMIT 20`
+  );
+
+  if (res.rows.length === 0) {
+    await bot.sendMessage(chatId, "✅ No pending USDT deposits.", {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "◀️ Back", callback_data: "admin_panel" }]] },
+    });
+    return;
+  }
+
+  let text = `💳 ${b("Pending USDT Deposits")} (${res.rows.length})\n\n`;
+  const buttons: TelegramBot.InlineKeyboardButton[][] = [];
+
+  for (const d of res.rows) {
+    const name = d.username ? `@${escapeHtml(d.username)}` : escapeHtml(d.first_name || `User#${d.user_id}`);
+    const age = Math.floor((Date.now() - new Date(d.created_at).getTime()) / 60000);
+    text += `👤 ${name} — ${b(formatUSD(d.usd_amount))} — ${age}m ago\n`;
+    text += `🔑 TrackID: ${code(d.oxapay_order_id || "N/A")}\n\n`;
+    buttons.push([{
+      text: `✅ Confirm ${formatUSD(d.usd_amount)} for ${d.username || d.user_id}`,
+      callback_data: `admin_confirm_deposit_${d.id}`,
+    }]);
+  }
+
+  buttons.push([{ text: "◀️ Back", callback_data: "admin_panel" }]);
+  await bot.sendMessage(chatId, text, {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+export async function handleAdminConfirmDeposit(bot: TelegramBot, chatId: number, depositId: number): Promise<void> {
+  const res = await query("SELECT * FROM deposits WHERE id=$1", [depositId]);
+  const dep = res.rows[0];
+  if (!dep) {
+    await bot.sendMessage(chatId, "❌ Deposit not found.");
+    return;
+  }
+  if (dep.status !== "pending") {
+    await bot.sendMessage(chatId, `ℹ️ Deposit already ${dep.status}.`);
+    return;
+  }
+
+  // Use the trackId for confirmation
+  const trackId = dep.oxapay_order_id || String(dep.id);
+  const amount = parseFloat(dep.usd_amount);
+
+  // Manually credit the deposit
+  await query("UPDATE deposits SET status='confirmed', confirmed_at=NOW() WHERE id=$1", [depositId]);
+  await adjustBalance(dep.user_id, amount, 0, "deposit", `Manual admin confirm — deposit #${depositId}`, trackId);
+  await query("UPDATE bot_users SET total_deposited = total_deposited + $1, updated_at=NOW() WHERE id=$2", [amount, dep.user_id]);
+
+  // Notify user
+  try {
+    const { getBotInstance } = await import("../bot");
+    const botInst = getBotInstance();
+    if (botInst) {
+      await botInst.sendMessage(dep.user_id, `✅ Your deposit of ${b(formatUSD(amount))} USDT has been confirmed!\n\nYour balance has been updated.`, { parse_mode: "HTML" });
+    }
+  } catch { /* user may have blocked bot */ }
+
+  await bot.sendMessage(chatId, `✅ Deposit #${depositId} confirmed — ${formatUSD(amount)} credited to user ${dep.user_id}.`, {
+    reply_markup: { inline_keyboard: [[{ text: "◀️ Back to Deposits", callback_data: "admin_pending_deposits" }]] },
+  });
 }

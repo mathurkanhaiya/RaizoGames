@@ -226,7 +226,32 @@ export async function setupDatabase(): Promise<void> {
     );
   }
 
-  // Also add the unique constraint on name if missing (safe to run multiple times)
+  // Deduplicate tasks by name (keep lowest ID; handle conflicting user_tasks)
+  await query(`
+    DO $$ 
+    DECLARE dup RECORD;
+    BEGIN
+      FOR dup IN
+        SELECT name, MIN(id) as keep_id, ARRAY_AGG(id ORDER BY id) as all_ids
+        FROM tasks GROUP BY name HAVING COUNT(*) > 1
+      LOOP
+        -- Delete user_tasks for duplicate IDs where the user already has the canonical task
+        DELETE FROM user_tasks
+        WHERE task_id = ANY(dup.all_ids)
+          AND task_id <> dup.keep_id
+          AND user_id IN (
+            SELECT user_id FROM user_tasks WHERE task_id = dup.keep_id
+          );
+        -- Reassign remaining user_tasks from duplicate IDs to canonical ID
+        UPDATE user_tasks SET task_id = dup.keep_id
+        WHERE task_id = ANY(dup.all_ids) AND task_id <> dup.keep_id;
+        -- Delete the duplicate task rows
+        DELETE FROM tasks WHERE name = dup.name AND id <> dup.keep_id;
+      END LOOP;
+    END $$
+  `);
+
+  // Add unique constraint on name if missing (safe to run multiple times)
   await query(`
     DO $$ BEGIN
       IF NOT EXISTS (
