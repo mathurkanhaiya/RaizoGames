@@ -125,7 +125,7 @@ export async function setupDatabase(): Promise<void> {
   await query(`
     CREATE TABLE IF NOT EXISTS tasks (
       id SERIAL PRIMARY KEY,
-      name VARCHAR(255) NOT NULL,
+      name VARCHAR(255) NOT NULL UNIQUE,
       description TEXT,
       task_type VARCHAR(64) NOT NULL,
       target_value INT NOT NULL DEFAULT 1,
@@ -220,11 +220,23 @@ export async function setupDatabase(): Promise<void> {
   for (const [name, description, task_type, target_value, reward] of tasks) {
     await query(
       `INSERT INTO tasks (name, description, task_type, target_value, reward)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT DO NOTHING`,
+       SELECT $1, $2, $3, $4, $5
+       WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE name = $1)`,
       [name, description, task_type, target_value, reward]
     );
   }
+
+  // Also add the unique constraint on name if missing (safe to run multiple times)
+  await query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'tasks'::regclass AND conname = 'tasks_name_key'
+      ) THEN
+        ALTER TABLE tasks ADD CONSTRAINT tasks_name_key UNIQUE (name);
+      END IF;
+    END $$
+  `);
 
   console.log("[DB] Auto-setup complete.");
 }

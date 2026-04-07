@@ -6,7 +6,18 @@ if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL must be set");
 }
 
-export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// Railway (and most cloud providers) require SSL for PostgreSQL.
+// rejectUnauthorized: false is needed because Railway uses self-signed certs.
+const isProduction = process.env.NODE_ENV === "production";
+
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: isProduction ? { rejectUnauthorized: false } : undefined,
+});
+
+pool.on("error", (err) => {
+  console.error("[DB] Pool error:", err.message);
+});
 
 // Simple one-shot query — for reads and non-transactional writes
 export async function query(sql: string, params?: unknown[]) {

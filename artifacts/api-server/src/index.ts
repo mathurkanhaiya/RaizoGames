@@ -17,7 +17,12 @@ if (Number.isNaN(port) || port <= 0) {
 
 async function main() {
   // Create all DB tables and seed default data on every cold start
-  await setupDatabase();
+  try {
+    await setupDatabase();
+  } catch (err) {
+    // Log but never crash — server must start even if DB setup has a hiccup
+    logger.error({ err }, "DB setup error — continuing startup anyway");
+  }
 
   app.listen(port, (err) => {
     if (err) {
